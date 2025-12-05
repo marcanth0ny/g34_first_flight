@@ -107,12 +107,11 @@ class G34FirstFlightNode(Node):
         )
 
         # Tuning modes: "none", "altitude_step", "attitude_step"
-        raw_tuning_mode = (
+        self.tuning_mode = (
             self.declare_parameter("tuning_mode", "none")
             .get_parameter_value()
             .string_value
         )
-        self.tuning_mode = self._normalize_tuning_mode(raw_tuning_mode)
 
         # Altitude step tuning
         self.alt_step_amplitude_m = (
@@ -145,12 +144,11 @@ class G34FirstFlightNode(Node):
         )
 
         # Final mode: "auto_land" or "precision_land"
-        raw_final_mode = (
+        self.final_mode = (
             self.declare_parameter("final_mode", "auto_land")
             .get_parameter_value()
             .string_value
         )
-        self.final_mode = self._normalize_final_mode(raw_final_mode)
 
         # Precision landing service (Tracktor-Beam)
         self.precision_land_service_name = (
@@ -195,7 +193,7 @@ class G34FirstFlightNode(Node):
         self.precision_land_client = None
         self.precision_land_future = None
 
-        # manual log throttling
+        # for manual log throttling
         self._last_log_times = {}
 
         # --- Logging setup ---------------------------------------------------
@@ -241,7 +239,6 @@ class G34FirstFlightNode(Node):
             qos,
         )
 
-        # ✅ FIXED: topic name must be self.vehicle_status_topic, not the callback
         self.vehicle_status_sub = self.create_subscription(
             VehicleStatus,
             self.vehicle_status_topic,
@@ -265,32 +262,10 @@ class G34FirstFlightNode(Node):
         self.timer_period = 0.1
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
 
-        # Summary log
         self.get_logger().info(
             f"tuning_mode='{self.tuning_mode}', final_mode='{self.final_mode}', "
             f"takeoff_altitude_m={self.takeoff_altitude_m:.2f} m"
         )
-
-    # -------------------------------------------------------------------------
-    # Mode normalization helpers
-    # -------------------------------------------------------------------------
-    @staticmethod
-    def _normalize_tuning_mode(raw: str) -> str:
-        r = raw.strip().lower()
-        if r in ("altitude", "altitude_step", "alt", "z", "alt_step"):
-            return "altitude_step"
-        if r in ("attitude", "attitude_step", "yaw", "yaw_step"):
-            return "attitude_step"
-        return "none"
-
-    @staticmethod
-    def _normalize_final_mode(raw: str) -> str:
-        r = raw.strip().lower()
-        if r in ("precision_land", "precision", "tracktor", "tracktor_beam"):
-            return "precision_land"
-        if r in ("descend", "land", "auto_land"):
-            return "auto_land"
-        return "auto_land"
 
     # -------------------------------------------------------------------------
     # Helpers
@@ -298,7 +273,14 @@ class G34FirstFlightNode(Node):
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
 
+    def _fmt(self, x):
+        return f"{x:.3f}" if x is not None else "NaN"
+
     def log_throttled(self, key: str, level: str, msg: str, period_s: float = 2.0):
+        """
+        Simple manual log throttling: log at most once per period_s for given key.
+        level: "info" or "warn" or "debug"
+        """
         now = self._now()
         last = self._last_log_times.get(key, None)
         if last is not None and (now - last) < period_s:
@@ -363,11 +345,11 @@ class G34FirstFlightNode(Node):
             self.mission_phase.name,
             self.tuning_mode,
             self.final_mode,
-            f"{alt_up:.3f}" if alt_up is not None else "",
-            f"{vz_ned:.3f}" if vz_ned is not None else "",
-            f"{yaw:.3f}" if yaw is not None else "",
-            f"{cmd_z_ned:.3f}" if cmd_z_ned is not None else "",
-            f"{yaw_cmd:.3f}" if yaw_cmd is not None else "",
+            self._fmt(alt_up),
+            self._fmt(vz_ned),
+            self._fmt(yaw),
+            self._fmt(cmd_z_ned),
+            self._fmt(yaw_cmd),
             "1" if landed else "0" if landed is not None else "",
             f"{nav_state}" if nav_state is not None else "",
             f"{arming_state}" if arming_state is not None else "",
@@ -388,8 +370,7 @@ class G34FirstFlightNode(Node):
         if self.last_local_position is not None:
             # PX4 NED frame: z is down, so altitude up = -z
             alt_up = -self.last_local_position.z
-            # NOTE: field is "vz", not "v_z"
-            vz_ned = self.last_local_position.vz
+            vz_ned = self.last_local_position.vz  # <-- correct field
 
         if self.last_land_detected is not None:
             landed = bool(self.last_land_detected.landed)
@@ -411,6 +392,15 @@ class G34FirstFlightNode(Node):
     # -------------------------------------------------------------------------
     def local_position_callback(self, msg: VehicleLocalPosition):
         self.last_local_position = msg
+
+        # If we haven't locked x/y yet, do it now
+        if self.x_hold_ned is None:
+            self.x_hold_ned = msg.x
+            self.y_hold_ned = msg.y
+            self.get_logger().info(
+                f"Local position received, locking hold position: "
+                f"x_hold={self.x_hold_ned:.2f}, y_hold={self.y_hold_ned:.2f}"
+            )
 
     def attitude_callback(self, msg: VehicleAttitude):
         self.last_attitude = msg
@@ -474,9 +464,9 @@ class G34FirstFlightNode(Node):
         # MAV_CMD_DO_SET_MODE: base_mode=1 (custom mode), main=6 (Offboard)
         self.send_vehicle_command(
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
-            param1=1.0,   # MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+            param1=1.0,   # base mode: MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
             param2=6.0,   # main mode: Offboard
-            param3=0.0,
+            param3=0.0,   # submode not used here
         )
         self.get_logger().info("Sending OFFBOARD mode command.")
 
@@ -498,6 +488,7 @@ class G34FirstFlightNode(Node):
         # Land at current location, PX4 handles descent + touchdown detection
         self.send_vehicle_command(
             VehicleCommand.VEHICLE_CMD_NAV_LAND,
+            # params left at 0 => land at current position
         )
         self.get_logger().info("Sending NAV_LAND command (PX4 auto-land).")
 
@@ -514,6 +505,7 @@ class G34FirstFlightNode(Node):
             self.mission_phase = MissionPhase.LAND_AUTO
             return
 
+        # Try once to see if service is there; non-blocking wait
         if not self.precision_land_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn(
                 "Precision landing service not available; falling back to auto_land."
@@ -528,10 +520,11 @@ class G34FirstFlightNode(Node):
         self.get_logger().info(
             f"Precision landing service '{self.precision_land_service_name}' called."
         )
+        # From this point, Tracktor-Beam should own Offboard setpoints.
         self.mission_phase = MissionPhase.PRECISION_LAND
 
     # -------------------------------------------------------------------------
-    # Land monitoring
+    # Land monitoring (used both for LAND_AUTO and PRECISION_LAND)
     # -------------------------------------------------------------------------
     def update_land_monitoring(self, now: float):
         _, _, landed = self._get_alt_vz_landed()
@@ -543,6 +536,7 @@ class G34FirstFlightNode(Node):
                     "Landing detected (VehicleLandDetected.landed=True), "
                     "starting post-land timer."
                 )
+        # We *do not* reset latch if landed becomes False again
 
         if (
             self.landed_latch_time is not None
@@ -556,10 +550,14 @@ class G34FirstFlightNode(Node):
     # Mission control
     # -------------------------------------------------------------------------
     def start_final_mode(self, now: float):
+        """
+        Called once when HOVER / tuning is complete to start the landing phase.
+        """
         if self.final_mode == "precision_land":
             self.get_logger().info("Starting precision landing handoff.")
             self.start_precision_landing(now)
         else:
+            # Default: PX4 auto-land
             self.get_logger().info("Starting PX4 auto-land.")
             self.send_land_command()
             self.land_command_sent = True
@@ -572,23 +570,39 @@ class G34FirstFlightNode(Node):
         now = self._now()
         alt_up, vz_ned, landed = self._get_alt_vz_landed()
         yaw_cmd = self.yaw_ref if self.yaw_ref is not None else 0.0
-        cmd_z_ned = None
+        cmd_z_ned = None  # what we send this cycle (if any)
 
-        # PREFLIGHT
+        # --- PREFLIGHT: wait for attitude, then start even if no local pos yet
         if self.mission_phase == MissionPhase.PREFLIGHT:
-            if self.last_local_position is None or self.last_attitude is None:
+            if self.last_attitude is None:
                 self.log_throttled(
-                    "preflight_wait",
+                    "preflight_wait_att",
                     "info",
-                    "Waiting for local position and attitude...",
+                    "Waiting for attitude...",
                     period_s=2.0,
                 )
                 self._log_sample(now, cmd_z_ned, yaw_cmd)
                 return
 
-            self.x_hold_ned = self.last_local_position.x
-            self.y_hold_ned = self.last_local_position.y
-            if self.yaw_ref is None:
+            if self.last_local_position is None:
+                # Start anyway with 0,0 and update once local pos arrives
+                if self.x_hold_ned is None:
+                    self.x_hold_ned = 0.0
+                    self.y_hold_ned = 0.0
+                self.log_throttled(
+                    "preflight_no_pos",
+                    "warn",
+                    "Attitude present but no VehicleLocalPosition yet; "
+                    "starting PRE_OFFBOARD with x_hold=y_hold=0. Will lock "
+                    "when first local position arrives.",
+                    period_s=2.0,
+                )
+            else:
+                # We have local position, lock it
+                self.x_hold_ned = self.last_local_position.x
+                self.y_hold_ned = self.last_local_position.y
+
+            if self.yaw_ref is None and self.last_attitude is not None:
                 self.yaw_ref = self._quat_to_yaw(self.last_attitude.q)
 
             self.preoffboard_start_time = now
@@ -598,8 +612,9 @@ class G34FirstFlightNode(Node):
                 f"y_hold={self.y_hold_ned:.2f}, yaw_ref={self.yaw_ref:.2f})"
             )
 
-        # PRE_OFFBOARD
+        # --- PRE_OFFBOARD: stream setpoints before mode switch --------------
         if self.mission_phase == MissionPhase.PRE_OFFBOARD:
+            # Hold just above ground (small negative z)
             z_ned_pre = -0.05
             cmd_z_ned = z_ned_pre
 
@@ -626,9 +641,10 @@ class G34FirstFlightNode(Node):
             self._log_sample(now, cmd_z_ned, yaw_cmd)
             return
 
-        # TAKEOFF_ASCEND
+        # --- TAKEOFF_ASCEND: rise to takeoff_altitude_m ---------------------
         if self.mission_phase == MissionPhase.TAKEOFF_ASCEND:
             if self.x_hold_ned is None or self.yaw_ref is None:
+                # Something went wrong; revert to PREFLIGHT
                 self.get_logger().warn(
                     "Missing x_hold or yaw_ref in TAKEOFF_ASCEND, reverting to PREFLIGHT."
                 )
@@ -646,10 +662,11 @@ class G34FirstFlightNode(Node):
 
             self.get_logger().info(
                 f"Phase=TAKEOFF_ASCEND, cmd_z_ned={cmd_z_ned:+.3f} m, "
-                f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
+                f"alt_up={self._fmt(alt_up)} m, vz_ned={self._fmt(vz_ned)} m/s, "
                 f"landed={landed}"
             )
 
+            # Check if we've reached altitude
             if alt_up is not None and alt_up >= 0.9 * target_alt:
                 self.hover_start_time = now
                 self.mission_phase = MissionPhase.HOVER
@@ -658,6 +675,7 @@ class G34FirstFlightNode(Node):
                     f"(alt_up={alt_up:.2f} m, target={target_alt:.2f} m)"
                 )
 
+            # Timeout safety
             if (
                 self.takeoff_start_time is not None
                 and (now - self.takeoff_start_time) > self.takeoff_timeout_s
@@ -673,7 +691,7 @@ class G34FirstFlightNode(Node):
             self._log_sample(now, cmd_z_ned, yaw_cmd)
             return
 
-        # HOVER
+        # --- HOVER: hold altitude and yaw for a fixed duration --------------
         if self.mission_phase == MissionPhase.HOVER:
             target_alt = self.takeoff_altitude_m
             cmd_z_ned = -target_alt
@@ -686,7 +704,7 @@ class G34FirstFlightNode(Node):
             dt_hover = now - self.hover_start_time
             self.get_logger().info(
                 f"Phase=HOVER, t={dt_hover:.1f} s, cmd_z_ned={cmd_z_ned:+.3f} m, "
-                f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s"
+                f"alt_up={self._fmt(alt_up)} m, vz_ned={self._fmt(vz_ned)} m/s"
             )
 
             if dt_hover >= self.hover_duration_s:
@@ -705,7 +723,7 @@ class G34FirstFlightNode(Node):
             self._log_sample(now, cmd_z_ned, yaw_cmd)
             return
 
-        # ALT_TUNING
+        # --- ALTITUDE TUNING: step alt around hover -------------------------
         if self.mission_phase == MissionPhase.ALT_TUNING:
             target_alt = self.takeoff_altitude_m
             amp = max(min(self.alt_step_amplitude_m, 0.5 * target_alt), 0.02)
@@ -716,7 +734,7 @@ class G34FirstFlightNode(Node):
                 alt_cmd = target_alt + amp / 2.0
             else:
                 alt_cmd = target_alt - amp / 2.0
-                alt_cmd = max(alt_cmd, 0.2)
+                alt_cmd = max(alt_cmd, 0.2)  # keep some margin above ground
 
             cmd_z_ned = -alt_cmd
             self.publish_offboard_control_mode()
@@ -727,7 +745,7 @@ class G34FirstFlightNode(Node):
             dt_tuning = now - self.tuning_start_time
             self.get_logger().info(
                 f"Phase=ALT_TUNING, t={dt_tuning:.1f} s, alt_cmd={alt_cmd:.3f} m, "
-                f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s"
+                f"alt_up={self._fmt(alt_up)} m, vz_ned={self._fmt(vz_ned)} m/s"
             )
 
             if dt_tuning >= self.tuning_duration_s:
@@ -737,11 +755,12 @@ class G34FirstFlightNode(Node):
             self._log_sample(now, cmd_z_ned, yaw_cmd)
             return
 
-        # ATT_TUNING
+        # --- ATTITUDE (YAW) TUNING -----------------------------------------
         if self.mission_phase == MissionPhase.ATT_TUNING:
             target_alt = self.takeoff_altitude_m
             cmd_z_ned = -target_alt
 
+            # yaw step around yaw_ref
             yaw_step_rad = math.radians(self.att_step_deg)
             period = max(self.att_step_period_s, 1.0)
             phase_t = (now - self.tuning_start_time) % period
@@ -759,7 +778,7 @@ class G34FirstFlightNode(Node):
             dt_tuning = now - self.tuning_start_time
             self.get_logger().info(
                 f"Phase=ATT_TUNING, t={dt_tuning:.1f} s, yaw_cmd={yaw_cmd:.3f} rad, "
-                f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s"
+                f"alt_up={self._fmt(alt_up)} m, vz_ned={self._fmt(vz_ned)} m/s"
             )
 
             if dt_tuning >= self.tuning_duration_s:
@@ -769,18 +788,21 @@ class G34FirstFlightNode(Node):
             self._log_sample(now, cmd_z_ned, yaw_cmd)
             return
 
-        # LAND_AUTO
+        # --- LAND_AUTO: PX4 auto-land & disarm ------------------------------
         if self.mission_phase == MissionPhase.LAND_AUTO:
+            # Do NOT publish Offboard setpoints here; PX4 is handling descent.
             self.update_land_monitoring(now)
 
             self.log_throttled(
                 "land_auto",
                 "info",
-                f"Phase=LAND_AUTO, alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
+                f"Phase=LAND_AUTO, alt_up={self._fmt(alt_up)} m, "
+                f"vz_ned={self._fmt(vz_ned)} m/s, "
                 f"landed={landed}, disarm_sent={self.disarm_sent}",
                 period_s=2.0,
             )
 
+            # Transition to DONE once disarm has been sent
             if self.disarm_sent:
                 self.mission_phase = MissionPhase.DONE
                 self.get_logger().info("LAND_AUTO complete -> DONE")
@@ -788,8 +810,10 @@ class G34FirstFlightNode(Node):
             self._log_sample(now, cmd_z_ned, yaw_cmd)
             return
 
-        # PRECISION_LAND
+        # --- PRECISION_LAND: Tracktor-Beam owns Offboard --------------------
         if self.mission_phase == MissionPhase.PRECISION_LAND:
+            # We do not publish Offboard setpoints here; Tracktor-Beam does.
+            # Just monitor landing and disarm.
             if (
                 self.precision_land_future is not None
                 and self.precision_land_future.done()
@@ -816,7 +840,8 @@ class G34FirstFlightNode(Node):
             self.log_throttled(
                 "precision_land",
                 "info",
-                f"Phase=PRECISION_LAND, alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
+                f"Phase=PRECISION_LAND, alt_up={self._fmt(alt_up)} m, "
+                f"vz_ned={self._fmt(vz_ned)} m/s, "
                 f"landed={landed}, disarm_sent={self.disarm_sent}",
                 period_s=2.0,
             )
@@ -828,7 +853,7 @@ class G34FirstFlightNode(Node):
             self._log_sample(now, cmd_z_ned, yaw_cmd)
             return
 
-        # DONE
+        # --- DONE: everything finished --------------------------------------
         if self.mission_phase == MissionPhase.DONE:
             self.log_throttled(
                 "done_state",
