@@ -13,6 +13,7 @@ from px4_msgs.msg import (
     VehicleCommand,
     VehicleLocalPosition,
     VehicleLandDetected,
+    VehicleAttitude,
 )
 
 
@@ -21,6 +22,7 @@ class FlightPhase(Enum):
     TAKEOFF_ASCEND = auto()
     HOVER = auto()
     DESCEND = auto()
+    FINAL_LAND = auto()
     DONE = auto()
 
 
@@ -29,26 +31,29 @@ class G34FirstFlightNode(Node):
         super().__init__('g34_first_flight_node')
 
         # ---------------- Parameters ----------------
+        # Basic altitude mission
         self.declare_parameter('takeoff_height_m', 0.5)
         self.declare_parameter('altitude_tolerance_m', 0.05)
-        self.declare_parameter('takeoff_min_time_s', 1.5)        # must spend at least this long climbing
-        self.declare_parameter('takeoff_timeout_s', 10.0)        # max time before we *force* HOVER
-        self.declare_parameter('position_hold_time_s', 5.0)      # time spent at hover height
-        self.declare_parameter('offboard_warmup_setpoints', 20)  # setpoints before OFFBOARD+ARM
+        self.declare_parameter('takeoff_min_time_s', 1.5)
+        self.declare_parameter('takeoff_timeout_s', 10.0)
+        self.declare_parameter('position_hold_time_s', 5.0)
+        self.declare_parameter('offboard_warmup_setpoints', 20)
 
-        # Landing handling
-        self.declare_parameter('landing_altitude_thresh_m', 0.05)
-        self.declare_parameter('landing_vz_thresh_mps', 0.10)
-        self.declare_parameter('landing_timeout_s', 15.0)
+        # Landing detection / timing
+        self.declare_parameter('landing_trigger_alt_m', 0.15)    # when to send NAV_LAND
+        self.declare_parameter('landing_vz_thresh_mps', 0.10)    # small vertical speed
+        self.declare_parameter('landing_done_delay_s', 0.5)      # delay after landed=True before disarm
+        self.declare_parameter('landing_phase_timeout_s', 20.0)  # safety timeout in FINAL_LAND
 
         # Optional tuning
         self.declare_parameter('tuning_mode', 'none')            # 'none', 'altitude', 'attitude'
         self.declare_parameter('tuning_step_amplitude_m', 0.2)
         self.declare_parameter('tuning_step_duration_s', 3.0)
 
-        # Topic name so you can swap v1 / non-v1
+        # Topic for local position (v1 vs non-v1)
         self.declare_parameter('local_position_topic', '/fmu/out/vehicle_local_position_v1')
 
+        # Read parameters
         self.takeoff_height_m = float(self.get_parameter('takeoff_height_m').value)
         self.altitude_tolerance_m = float(self.get_parameter('altitude_tolerance_m').value)
         self.takeoff_min_time_s = float(self.get_parameter('takeoff_min_time_s').value)
@@ -56,9 +61,10 @@ class G34FirstFlightNode(Node):
         self.position_hold_time_s = float(self.get_parameter('position_hold_time_s').value)
         self.offboard_warmup_setpoints = int(self.get_parameter('offboard_warmup_setpoints').value)
 
-        self.landing_altitude_thresh_m = float(self.get_parameter('landing_altitude_thresh_m').value)
+        self.landing_trigger_alt_m = float(self.get_parameter('landing_trigger_alt_m').value)
         self.landing_vz_thresh_mps = float(self.get_parameter('landing_vz_thresh_mps').value)
-        self.landing_timeout_s = float(self.get_parameter('landing_timeout_s').value)
+        self.landing_done_delay_s = float(self.get_parameter('landing_done_delay_s').value)
+        self.landing_phase_timeout_s = float(self.get_parameter('landing_phase_timeout_s').value)
 
         self.tuning_mode = str(self.get_parameter('tuning_mode').value).lower()
         self.tuning_step_amplitude_m = float(self.get_parameter('tuning_step_amplitude_m').value)
@@ -74,7 +80,7 @@ class G34FirstFlightNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
 
-        # ---------------- Publishers (to PX4) ----------------
+        # ---------------- Publishers to PX4 ----------------
         self.offboard_control_mode_pub = self.create_publisher(
             OffboardControlMode, '/fmu/in/offboard_control_mode', qos_px4
         )
@@ -85,36 +91,37 @@ class G34FirstFlightNode(Node):
             VehicleCommand, '/fmu/in/vehicle_command', qos_px4
         )
 
-        # ---------------- Subscribers (from PX4) ----------------
+        # ---------------- Subscribers from PX4 ----------------
         self.local_position_sub = self.create_subscription(
-            VehicleLocalPosition,
-            local_position_topic,
-            self.local_position_callback,
-            qos_px4,
+            VehicleLocalPosition, local_position_topic, self.local_position_callback, qos_px4
         )
-
         self.land_detected_sub = self.create_subscription(
-            VehicleLandDetected,
-            '/fmu/out/vehicle_land_detected',
-            self.land_detected_callback,
-            qos_px4,
+            VehicleLandDetected, '/fmu/out/vehicle_land_detected', self.land_detected_callback, qos_px4
+        )
+        self.attitude_sub = self.create_subscription(
+            VehicleAttitude, '/fmu/out/vehicle_attitude', self.attitude_callback, qos_px4
         )
 
         # ---------------- State variables ----------------
         self.flight_phase = FlightPhase.PREFLIGHT
         self.offboard_setpoint_counter = 0
 
-        self.current_altitude_up = None       # m, up-positive (= -z_ned)
-        self.current_vz_ned = None            # m/s, NED (down positive)
-        self.landed_flag = False              # PX4 land detector
+        self.current_altitude_up = None     # m (up-positive)
+        self.current_vz_ned = None          # m/s (down-positive)
+        self.landed_flag = False            # PX4 land detector
 
-        self.last_altitude_print_time = 0.0
+        self.current_yaw = None             # rad
+        self.initial_yaw = None             # rad (captured pre-takeoff)
+
+        self.last_status_print_time = 0.0
 
         self.mission_start_time = None
         self.hover_start_time = None
         self.descend_start_time = None
+        self.final_land_start_time = None
+        self.landed_time = None             # when PX4 first says landed=True
 
-        # Main loop timer (50 ms)
+        # Main loop timer
         self.dt = 0.05
         self.timer = self.create_timer(self.dt, self.timer_callback)
 
@@ -124,21 +131,30 @@ class G34FirstFlightNode(Node):
     # Callbacks
     # -------------------------------------------------------------------------
     def local_position_callback(self, msg: VehicleLocalPosition):
-        """
-        PX4 local position: NED (z positive DOWN).
-        We always use -z as altitude up. No z_valid gating.
-        """
+        # NED frame: z positive down; altitude up = -z
         self.current_altitude_up = -msg.z
-        self.current_vz_ned = msg.vz  # + down, - up
+        self.current_vz_ned = msg.vz
 
     def land_detected_callback(self, msg: VehicleLandDetected):
         prev = self.landed_flag
         self.landed_flag = bool(msg.landed)
         if self.landed_flag and not prev:
-            self.get_logger().info('PX4 reports landed=True.')
+            self.landed_time = self.get_clock().now().nanoseconds / 1e9
+            self.get_logger().info('PX4 land detector: landed=True')
+
+    def attitude_callback(self, msg: VehicleAttitude):
+        # PX4 quaternion order: [w, x, y, z]
+        w, x, y, z = msg.q
+        # yaw from quaternion
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        self.current_yaw = yaw
+        if self.initial_yaw is None:
+            self.initial_yaw = yaw
 
     # -------------------------------------------------------------------------
-    # PX4 VehicleCommand helpers
+    # VehicleCommand helpers
     # -------------------------------------------------------------------------
     def publish_vehicle_command(self, command: int, param1: float = 0.0, param2: float = 0.0):
         msg = VehicleCommand()
@@ -168,16 +184,19 @@ class G34FirstFlightNode(Node):
 
     def set_offboard_mode(self):
         self.get_logger().info('Sending OFFBOARD mode command.')
-        # param1 = 1 (custom), param2 = 6 (Offboard)
+        # Param1 = 1 (custom), Param2 = 6 (Offboard)
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
 
+    def command_nav_land(self):
+        self.get_logger().info('Sending NAV_LAND command to PX4.')
+        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND, 0.0, 0.0)
+
     # -------------------------------------------------------------------------
-    # Offboard message publishers
+    # Offboard control publishers
     # -------------------------------------------------------------------------
     def publish_offboard_control_mode(self):
         msg = OffboardControlMode()
         msg.timestamp = self.get_clock().now().nanoseconds // 1000
-        # Position-only Offboard; PX4 handles altitude & attitude
         msg.position = True
         msg.velocity = False
         msg.acceleration = False
@@ -186,33 +205,30 @@ class G34FirstFlightNode(Node):
         self.offboard_control_mode_pub.publish(msg)
 
     def publish_trajectory_setpoint(self, x_ned: float, y_ned: float, z_ned: float):
-        """
-        Position-only setpoint; yaw is set to NaN so PX4 *does not change yaw*.
-        This minimizes initial yaw motion and keeps mission stable.
-        """
         msg = TrajectorySetpoint()
         msg.timestamp = self.get_clock().now().nanoseconds // 1000
         msg.position = [float(x_ned), float(y_ned), float(z_ned)]
         msg.velocity = [math.nan, math.nan, math.nan]
         msg.acceleration = [math.nan, math.nan, math.nan]
         msg.jerk = [math.nan, math.nan, math.nan]
-        msg.yaw = math.nan  # let PX4 keep current yaw
+        # Hold initial yaw to avoid yaw slewing on takeoff
+        if self.initial_yaw is not None:
+            msg.yaw = float(self.initial_yaw)
+        else:
+            msg.yaw = math.nan
         self.trajectory_setpoint_pub.publish(msg)
 
     # -------------------------------------------------------------------------
-    # Tuning profiles (optional)
+    # Tuning profiles
     # -------------------------------------------------------------------------
     def altitude_tuning_profile(self, t_rel: float) -> float:
         """
         Altitude step sequence around nominal hover height.
-        t_rel: time [s] since start of HOVER phase.
-        Returns commanded altitude [m, up] relative to home.
         """
         h0 = self.takeoff_height_m
         amp = self.tuning_step_amplitude_m
         seg = self.tuning_step_duration_s
 
-        # h0  -> h0+amp -> h0-amp -> h0
         if t_rel < seg:
             return h0
         elif t_rel < 2 * seg:
@@ -224,14 +240,12 @@ class G34FirstFlightNode(Node):
 
     def attitude_tuning_profile(self, t_rel: float):
         """
-        Lateral position (x,y) step sequence for indirect attitude tuning.
-        t_rel: time [s] since start of HOVER phase.
-        Returns (x_cmd, y_cmd) in NED [m].
+        Lateral position step sequence for indirect attitude tuning.
+        Returns (x_cmd, y_cmd) in NED (m).
         """
         amp = self.tuning_step_amplitude_m
         seg = self.tuning_step_duration_s
 
-        # Forward, back, right, left
         if t_rel < seg:
             return 0.0, 0.0
         elif t_rel < 2 * seg:
@@ -246,26 +260,26 @@ class G34FirstFlightNode(Node):
             return 0.0, 0.0
 
     # -------------------------------------------------------------------------
-    # Main loop / state machine
+    # Main timer / state machine
     # -------------------------------------------------------------------------
     def timer_callback(self):
         now = self.get_clock().now().nanoseconds / 1e9  # seconds
 
-        # Always stream offboard heartbeat
+        # Always stream Offboard heartbeat
         self.publish_offboard_control_mode()
 
-        # Default commanded position in NED
+        # Default NED position
         x_cmd = 0.0
         y_cmd = 0.0
+        z_cmd = 0.0
 
-        # 1) Warmup: must send setpoints before switching to Offboard
+        # Warmup setpoints before Offboard
         if self.offboard_setpoint_counter < self.offboard_warmup_setpoints:
-            z_cmd = 0.0  # stay at "ground" during warmup
             self.publish_trajectory_setpoint(x_cmd, y_cmd, z_cmd)
             self.offboard_setpoint_counter += 1
             return
 
-        # 2) After warmup: enter OFFBOARD and arm (once)
+        # Enter Offboard + ARM once
         if self.flight_phase == FlightPhase.PREFLIGHT:
             self.set_offboard_mode()
             self.arm()
@@ -273,11 +287,10 @@ class G34FirstFlightNode(Node):
             self.mission_start_time = now
             self.get_logger().info('PREFLIGHT -> TAKEOFF_ASCEND')
 
-        # 3) Phase logic
+        # ---------------- Phase logic ----------------
         if self.flight_phase == FlightPhase.TAKEOFF_ASCEND:
-            # Command target altitude; PX4 climbs to it
-            z_cmd = -self.takeoff_height_m  # NED: up is negative
-
+            # Command target hover altitude
+            z_cmd = -self.takeoff_height_m
             time_in_phase = now - (self.mission_start_time or now)
 
             alt_ok = False
@@ -285,10 +298,6 @@ class G34FirstFlightNode(Node):
                 alt_err = abs(self.current_altitude_up - self.takeoff_height_m)
                 alt_ok = alt_err < self.altitude_tolerance_m
 
-            # Require BOTH:
-            #   - altitude near target, AND
-            #   - minimum time in phase
-            # Use timeout as last resort
             if alt_ok and time_in_phase > self.takeoff_min_time_s:
                 self.flight_phase = FlightPhase.HOVER
                 self.hover_start_time = now
@@ -299,81 +308,82 @@ class G34FirstFlightNode(Node):
                 self.flight_phase = FlightPhase.HOVER
                 self.hover_start_time = now
                 self.get_logger().warn(
-                    f'TAKEOFF_ASCEND timeout -> HOVER (alt_up='
-                    f'{self.current_altitude_up if self.current_altitude_up is not None else float("nan"):.2f} m)'
+                    'TAKEOFF_ASCEND timeout -> HOVER '
+                    f'(alt_up={self.current_altitude_up if self.current_altitude_up is not None else float("nan"):.2f} m)'
                 )
 
         elif self.flight_phase == FlightPhase.HOVER:
             t_hover = now - (self.hover_start_time or now)
-
-            # Start at nominal altitude
             alt_cmd = self.takeoff_height_m
 
-            # Optional altitude tuning
             if self.tuning_mode == 'altitude':
                 alt_cmd = self.altitude_tuning_profile(t_hover)
 
-            # Optional lateral (indirect attitude) tuning
             if self.tuning_mode == 'attitude':
                 x_cmd, y_cmd = self.attitude_tuning_profile(t_hover)
 
             z_cmd = -alt_cmd
 
-            # After hold time, begin descent
             if t_hover > self.position_hold_time_s:
                 self.flight_phase = FlightPhase.DESCEND
                 self.descend_start_time = now
                 self.get_logger().info('HOVER -> DESCEND')
 
         elif self.flight_phase == FlightPhase.DESCEND:
-            # Command back to “ground level” z=0 in NED
+            # Simple approach: command back to "ground" z=0
             z_cmd = 0.0
             time_in_phase = now - (self.descend_start_time or now)
 
-            alt_ok_for_landing = (
+            # Once we're close to ground, we hand over to native PX4 land logic
+            alt_ok_for_land = (
                 self.current_altitude_up is not None
-                and abs(self.current_altitude_up) < self.landing_altitude_thresh_m
+                and self.current_altitude_up < self.landing_trigger_alt_m
+                and self.current_altitude_up > -0.05  # avoid negative nonsense
             )
-            vz_ok_for_landing = (
+            vz_small = (
                 self.current_vz_ned is not None
-                and abs(self.current_vz_ned) < self.landing_vz_thresh_mps
+                and abs(self.current_vz_ned) < 1.0  # just to avoid crazy transitions
             )
 
-            # Preferred path: PX4 land detector says we're landed
-            if self.landed_flag and alt_ok_for_landing and vz_ok_for_landing:
-                self.disarm()
-                self.flight_phase = FlightPhase.DONE
+            if alt_ok_for_land and vz_small:
+                self.command_nav_land()
+                self.flight_phase = FlightPhase.FINAL_LAND
+                self.final_land_start_time = now
                 self.get_logger().info(
-                    f'DESCEND -> DONE (PX4 landed=True, alt_up={self.current_altitude_up:.3f}, '
-                    f'vz_ned={self.current_vz_ned:.3f})'
+                    f'DESCEND -> FINAL_LAND (alt_up={self.current_altitude_up:.3f} m)'
                 )
 
-            # Fallback: no landed flag after long time, but we are at ground & nearly stopped
-            elif (
-                time_in_phase > self.landing_timeout_s
-                and alt_ok_for_landing
-                and vz_ok_for_landing
-            ):
+        elif self.flight_phase == FlightPhase.FINAL_LAND:
+            # In FINAL_LAND we **do not fight PX4**. We just keep a benign setpoint near ground.
+            z_cmd = 0.0
+            time_in_phase = now - (self.final_land_start_time or now)
+
+            # If PX4 reports landed, disarm after a short delay
+            if self.landed_flag and self.landed_time is not None:
+                if now - self.landed_time >= self.landing_done_delay_s:
+                    self.disarm()
+                    self.flight_phase = FlightPhase.DONE
+                    self.get_logger().info(
+                        'FINAL_LAND -> DONE (PX4 landed=True and disarm sent)'
+                    )
+
+            # Safety timeout: if something is weird, but PX4 *still* says not landed,
+            # we DO NOT force disarm (to stay safe). The pilot can take over.
+            if time_in_phase > self.landing_phase_timeout_s and not self.landed_flag:
                 self.get_logger().warn(
-                    'Landing timeout: forcing DISARM based on altitude & vertical speed only.'
+                    'FINAL_LAND timeout: PX4 still not landed. '
+                    'Holding DONE without disarm; operator intervention required.'
                 )
-                self.disarm()
                 self.flight_phase = FlightPhase.DONE
 
         elif self.flight_phase == FlightPhase.DONE:
-            # Keep commanding ground position for a bit; PX4 may ignore once disarmed,
-            # but it doesn't hurt and keeps Offboard happy while we shut down.
-            z_cmd = 0.0
+            z_cmd = 0.0  # keep a harmless setpoint
 
-        else:
-            # Fallback
-            z_cmd = 0.0
-
-        # Publish trajectory setpoint for the current phase
+        # Publish the currently commanded setpoint
         self.publish_trajectory_setpoint(x_cmd, y_cmd, z_cmd)
 
-        # 4) Live altitude / speed / land state printout (2 Hz)
-        if now - self.last_altitude_print_time > 0.5:
+        # ---------------- Status printout (2 Hz) ----------------
+        if now - self.last_status_print_time > 0.5:
             alt_str = (
                 f'{self.current_altitude_up:.3f} m'
                 if self.current_altitude_up is not None
@@ -389,7 +399,7 @@ class G34FirstFlightNode(Node):
                 f'cmd_z_ned={z_cmd:.3f} m, alt_up={alt_str}, vz_ned={vz_str}, '
                 f'landed={self.landed_flag}'
             )
-            self.last_altitude_print_time = now
+            self.last_status_print_time = now
 
 
 def main(args=None):
