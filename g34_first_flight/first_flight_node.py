@@ -49,14 +49,17 @@ class G34FirstFlightNode(Node):
         super().__init__("g34_first_flight_node")
 
         # === Parameters ===
-        self.declare_parameter("use_sim_time", False)
         self.declare_parameter("local_position_topic", "/fmu/out/vehicle_local_position_v1")
         self.declare_parameter("takeoff_altitude_m", 0.5)
         self.declare_parameter("tuning_mode", "none")         # "none" | "altitude" | "attitude"
         self.declare_parameter("final_mode", "descend")       # "descend" | "auto_land" | "precision_land"
         self.declare_parameter("enable_csv_logging", True)
 
-        self.use_sim_time = self.get_parameter("use_sim_time").get_parameter_value().bool_value
+        if self.has_parameter("use_sim_time"):
+            self.use_sim_time = self.get_parameter("use_sim_time").get_parameter_value().bool_value
+        else:
+            self.use_sim_time = False
+
         self.local_position_topic = self.get_parameter("local_position_topic").get_parameter_value().string_value
         self.takeoff_altitude_m = float(self.get_parameter("takeoff_altitude_m").get_parameter_value().double_value)
         self.tuning_mode = self.get_parameter("tuning_mode").get_parameter_value().string_value.lower()
