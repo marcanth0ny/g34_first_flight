@@ -19,7 +19,7 @@ def generate_launch_description():
                 {'run_altitude_tuning': True},
                 {'run_attitude_tuning': True},
                 {'attitude_step_deg': 5.0},
-                {'hover_thrust_norm': 0.40},
+                {'hover_thrust_norm': 0.30},
             ],
         )
     ])
