@@ -177,7 +177,6 @@ class G34FirstFlightNode(Node):
         self.offboard_control_mode_pub.publish(msg)
 
     def publish_trajectory_setpoint(self, vz_ned: float):
-        
         msg = TrajectorySetpoint()
         msg.timestamp = self.get_clock().now().nanoseconds // 1000
 
@@ -241,8 +240,8 @@ class G34FirstFlightNode(Node):
         self.get_logger().info('Sending ARM command.')
         cmd = VehicleCommand()
         cmd.timestamp = self.get_clock().now().nanoseconds // 1000
-        cmd.param1 = 1.0
-        cmd.command = VehicleCommand.VEHICLE_COMMAND_ARM_DISARM
+        cmd.param1 = 1.0  # 1 = arm, 0 = disarm
+        cmd.command = VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM
         cmd.target_system = 1
         cmd.target_component = 1
         cmd.source_system = 1
@@ -254,28 +253,30 @@ class G34FirstFlightNode(Node):
         self.get_logger().info('Sending DISARM command.')
         cmd = VehicleCommand()
         cmd.timestamp = self.get_clock().now().nanoseconds // 1000
-        cmd.param1 = 0.0
-        cmd.command = VehicleCommand.VEHICLE_COMMAND_ARM_DISARM
+        cmd.param1 = 0.0  # 1 = arm, 0 = disarm
+        cmd.command = VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM
         cmd.target_system = 1
         cmd.target_component = 1
         cmd.source_system = 1
         cmd.source_component = 1
         cmd.from_external = True
-        self.vehicle_command_pub.publish(cmd)
-
+        self.vehicle_command_pub.publish(cmd)        
+        
     def set_offboard_mode(self):
         self.get_logger().info('Sending OFFBOARD mode command.')
         cmd = VehicleCommand()
         cmd.timestamp = self.get_clock().now().nanoseconds // 1000
-        cmd.command = VehicleCommand.VEHICLE_COMMAND_DO_SET_MODE
-        cmd.param1 = 1.0   # main mode
-        cmd.param2 = 6.0   # PX4_CUSTOM_MAIN_MODE_OFFBOARD
+        cmd.command = VehicleCommand.VEHICLE_CMD_DO_SET_MODE
+        cmd.param1 = 1.0  # main mode
+
+        cmd.param2 = 6.0  # PX4_CUSTOM_MAIN_MODE_OFFBOARD
         cmd.target_system = 1
         cmd.target_component = 1
         cmd.source_system = 1
         cmd.source_component = 1
         cmd.from_external = True
         self.vehicle_command_pub.publish(cmd)
+        
 
     # -------------------------------------------------------------------------
     # Vertical control
