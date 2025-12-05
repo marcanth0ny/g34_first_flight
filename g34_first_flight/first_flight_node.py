@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import math
+from enum import Enum, auto
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from px4_msgs.msg import (
     OffboardControlMode,
@@ -11,88 +14,166 @@ from px4_msgs.msg import (
     VehicleCommand,
     VehicleStatus,
     DistanceSensor,
-    VehicleAttitude,
-    VehicleAttitudeSetpoint,
     VehicleLocalPosition,
+    VehicleAttitudeSetpoint,
 )
+
+
+class FlightPhase(Enum):
+    IDLE = auto()
+    PRE_OFFBOARD = auto()
+    TAKEOFF = auto()
+    ALT_HOLD = auto()
+    ALT_TUNING = auto()
+    ATT_TUNING_ROLL = auto()
+    ATT_TUNING_PITCH = auto()
+    LAND = auto()
+    DONE = auto()
 
 
 class G34FirstFlightNode(Node):
     """
-    First autonomous hop flight for PLEUAV with two tuning sequences:
-      - Altitude step tuning (vertical dynamics)
-      - Attitude step tuning (roll & pitch)
+    G34 First Flight / Altitude + Attitude Tuning Node
 
-    State machine:
+    Sequence:
+      1. PRE_OFFBOARD: stream OffboardControlMode + zero setpoints.
+      2. Send OFFBOARD + ARM.
+      3. TAKEOFF: climb to target height using vertical velocity (NED).
+      4. ALT_HOLD: hold altitude for hover_time_s.
+      5. ALT_TUNING (optional): small ±Δh altitude steps for vertical tuning.
+      6. ATT_TUNING_ROLL (optional): roll step sequence around hover.
+      7. ATT_TUNING_PITCH (optional): pitch step sequence around hover.
+      8. LAND: gentle descent and disarm.
+      9. DONE: keep streaming zero setpoints for safety.
 
-      PRE_OFFBOARD -> TAKEOFF -> ALT_HOLD
-        -> (optional) ALT_TUNING
-        -> (optional) ATT_TUNING
-        -> DESCEND -> DONE
+    Altitude source:
+      - Prefer rangefinder (DistanceSensor) when valid.
+      - Otherwise use VehicleLocalPosition (NED z → altitude up).
+
+    Attitude tuning:
+      - Uses VehicleAttitudeSetpoint (roll/pitch commands, constant hover thrust).
     """
 
     def __init__(self):
         super().__init__('g34_first_flight_node')
 
-        # === Parameters ===
-        self.declare_parameter('takeoff_height_m', 0.50)
-        self.declare_parameter('descent_height_m', 0.10)
-        self.declare_parameter('hover_time_s', 5.0)
-        self.declare_parameter('vertical_speed_limit_mps', 0.4)
+        # === High-level parameters ===
+        self.declare_parameter('takeoff_height_m', 0.5)
+        self.declare_parameter('hover_time_s', 3.0)
+
+        # Offboard / topic config
+        self.declare_parameter('use_rangefinder', True)
+        # Adjust to '/fmu/out/vehicle_local_position_v1' if that is your topic
+        self.declare_parameter('local_position_topic', '/fmu/out/vehicle_local_position')
+
+        # Altitude controller (velocity mode)
         self.declare_parameter('altitude_kp', 1.0)
-        self.declare_parameter('range_min_valid_m', 0.15)
-        self.declare_parameter('range_max_valid_m', 2.00)
+        self.declare_parameter('vz_max_up', 0.4)       # max climb speed (m/s, up)
+        self.declare_parameter('vz_max_down', 0.4)     # max descent speed (m/s, down)
+        self.declare_parameter('alt_tolerance_m', 0.05)
 
-        self.declare_parameter('run_altitude_tuning', True)
-        self.declare_parameter('run_attitude_tuning', True)
-        self.declare_parameter('attitude_step_deg', 5.0)
-        self.declare_parameter('hover_thrust_norm', 0.40)
+        # Altitude tuning phase
+        self.declare_parameter('enable_alt_tuning', True)
+        self.declare_parameter('alt_tuning_step_m', 0.1)
+        self.declare_parameter('alt_tuning_step_time_s', 3.0)
 
-        self.takeoff_height = float(self.get_parameter('takeoff_height_m').value)
-        self.descent_height = float(self.get_parameter('descent_height_m').value)
+        # Attitude tuning phase
+        self.declare_parameter('enable_att_tuning', True)
+        self.declare_parameter('att_step_deg', 5.0)
+        self.declare_parameter('att_step_time_s', 2.0)
+        self.declare_parameter('att_num_cycles', 2)
+        # Hover thrust estimate for attitude mode (normalized 0–1)
+        self.declare_parameter('hover_thrust', 0.4)
+        # Small P-like correction from altitude error to thrust
+        self.declare_parameter('altitude_kp_thrust', 0.5)
+
+        # === Fetch parameters ===
+        self.takeoff_height_m = float(self.get_parameter('takeoff_height_m').value)
         self.hover_time_s = float(self.get_parameter('hover_time_s').value)
-        self.vert_speed_limit = float(self.get_parameter('vertical_speed_limit_mps').value)
-        self.altitude_kp = float(self.get_parameter('altitude_kp').value)
-        self.range_min_valid = float(self.get_parameter('range_min_valid_m').value)
-        self.range_max_valid = float(self.get_parameter('range_max_valid_m').value)
 
-        self.run_altitude_tuning = bool(self.get_parameter('run_altitude_tuning').value)
-        self.run_attitude_tuning = bool(self.get_parameter('run_attitude_tuning').value)
-        self.attitude_step_deg = float(self.get_parameter('attitude_step_deg').value)
-        self.hover_thrust_norm = float(self.get_parameter('hover_thrust_norm').value)
+        self.use_rangefinder = bool(self.get_parameter('use_rangefinder').value)
+        self.local_position_topic = self.get_parameter('local_position_topic').value
+
+        self.altitude_kp = float(self.get_parameter('altitude_kp').value)
+        self.vz_max_up = float(self.get_parameter('vz_max_up').value)
+        self.vz_max_down = float(self.get_parameter('vz_max_down').value)
+        self.alt_tolerance_m = float(self.get_parameter('alt_tolerance_m').value)
+
+        self.enable_alt_tuning = bool(self.get_parameter('enable_alt_tuning').value)
+        self.alt_tuning_step_m = float(self.get_parameter('alt_tuning_step_m').value)
+        self.alt_tuning_step_time_s = float(self.get_parameter('alt_tuning_step_time_s').value)
+
+        self.enable_att_tuning = bool(self.get_parameter('enable_att_tuning').value)
+        self.att_step_deg = float(self.get_parameter('att_step_deg').value)
+        self.att_step_time_s = float(self.get_parameter('att_step_time_s').value)
+        self.att_num_cycles = int(self.get_parameter('att_num_cycles').value)
+        self.hover_thrust = float(self.get_parameter('hover_thrust').value)
+        self.altitude_kp_thrust = float(self.get_parameter('altitude_kp_thrust').value)
+
+        # Derived attitude tuning sequences (roll & pitch)
+        self.att_step_rad = math.radians(self.att_step_deg)
+        base_seq = [0.0, self.att_step_rad, 0.0, -self.att_step_rad, 0.0]
+        self.roll_step_sequence = base_seq * self.att_num_cycles
+        self.pitch_step_sequence = base_seq * self.att_num_cycles
+
+        # Altitude tuning sequence around takeoff height
+        self.alt_tuning_targets = [
+            self.takeoff_height_m + self.alt_tuning_step_m,
+            self.takeoff_height_m - self.alt_tuning_step_m,
+        ]
+        self.alt_tuning_index = 0
 
         # === Internal state ===
-        self.state = 'PRE_OFFBOARD'
+        self.phase = FlightPhase.PRE_OFFBOARD
         self.state_start_time = self.get_clock().now()
         self.offboard_setpoint_counter = 0
 
-        self.altitude_m = None
-        self.vehicle_status = VehicleStatus()
-        self.vehicle_attitude = VehicleAttitude()
-        self.altitude_lpos_m = None         # from VehicleLocalPosition (NED -> up)
+        # Altitude tracking
+        self.alt_range_m = None   # from DistanceSensor (up)
+        self.alt_lpos_m = None    # from VehicleLocalPosition (up)
+        self.alt_valid = False
 
-        self.alt_tuning_done = False
-        self.att_tuning_done = False
+        # PX4 status
+        self.vehicle_status = VehicleStatus()
+
+        # Rangefinder bounds
+        self.range_min_valid = 0.02
+        self.range_max_valid = 5.0
+
+        # Attitude tuning indices
+        self.att_step_index = 0
+
+        # Debug print throttling
+        self.last_debug_print_time = 0.0
 
         # === QoS ===
-        qos_sensor = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+        qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
         )
 
         # === Publishers ===
         self.offboard_control_mode_pub = self.create_publisher(
-            OffboardControlMode, '/fmu/in/offboard_control_mode', 10
+            OffboardControlMode,
+            '/fmu/in/offboard_control_mode',
+            qos
         )
         self.trajectory_setpoint_pub = self.create_publisher(
-            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', 10
+            TrajectorySetpoint,
+            '/fmu/in/trajectory_setpoint',
+            qos
         )
         self.vehicle_command_pub = self.create_publisher(
-            VehicleCommand, '/fmu/in/vehicle_command', 10
+            VehicleCommand,
+            '/fmu/in/vehicle_command',
+            qos
         )
         self.attitude_setpoint_pub = self.create_publisher(
-            VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint', 10
+            VehicleAttitudeSetpoint,
+            '/fmu/in/vehicle_attitude_setpoint',
+            qos
         )
 
         # === Subscribers ===
@@ -100,35 +181,40 @@ class G34FirstFlightNode(Node):
             VehicleStatus,
             '/fmu/out/vehicle_status',
             self.vehicle_status_callback,
-            qos_sensor,
+            qos
         )
 
         self.rangefinder_sub = self.create_subscription(
             DistanceSensor,
             '/fmu/out/distance_sensor',
             self.distance_sensor_callback,
-            qos_sensor,
+            qos
         )
 
         self.local_position_sub = self.create_subscription(
             VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
-            self.vehicle_local_position_callback,
-            qos_sensor,
+            self.local_position_topic,
+            self.local_position_callback,
+            qos
         )
 
-        self.attitude_sub = self.create_subscription(
-            VehicleAttitude,
-            '/fmu/out/vehicle_attitude',
-            self.vehicle_attitude_callback,
-            qos_sensor,
-        )
-
-        # === Timer @ 50 Hz ===
-        self.timer_period_s = 0.02
-        self.timer = self.create_timer(self.timer_period_s, self.timer_callback)
+        # === Timer ===
+        self.timer = self.create_timer(0.02, self.timer_callback)  # 50 Hz
 
         self.get_logger().info('G34 First Flight node initialized.')
+
+    # -------------------------------------------------------------------------
+    # Time helpers
+    # -------------------------------------------------------------------------
+
+    def now(self):
+        return self.get_clock().now()
+
+    def seconds_since(self, t):
+        return (self.now() - t).nanoseconds * 1e-9
+
+    def seconds_since_start(self):
+        return self.now().nanoseconds * 1e-9
 
     # -------------------------------------------------------------------------
     # Callbacks
@@ -138,129 +224,148 @@ class G34FirstFlightNode(Node):
         self.vehicle_status = msg
 
     def distance_sensor_callback(self, msg: DistanceSensor):
-        if (
-            msg.current_distance > self.range_min_valid
-            and msg.current_distance < self.range_max_valid
-        ):
-            self.altitude_m = msg.current_distance
+        if not self.use_rangefinder:
+            return
 
-    def vehicle_attitude_callback(self, msg: VehicleAttitude):
-        self.vehicle_attitude = msg
-    
-    def vehicle_local_position_callback(self, msg: VehicleLocalPosition):
+        d = float(msg.current_distance)
+        if self.range_min_valid < d < self.range_max_valid:
+            self.alt_range_m = d
+
+    def local_position_callback(self, msg: VehicleLocalPosition):
+        # NED frame: z is down; altitude up is -z
+        self.alt_lpos_m = -float(msg.z)
+
+    # -------------------------------------------------------------------------
+    # Altitude utilities
+    # -------------------------------------------------------------------------
+
+    def get_altitude_up_m(self):
         """
-        Use PX4 local position as a fallback altitude source.
-
-        VehicleLocalPosition is in NED frame:
-          x: north (m)
-          y: east (m)
-          z: down (m, positive down)
-
-        We define altitude_m as "upwards from ground" -> -z.
+        Returns altitude in meters (upward), preferring rangefinder if valid,
+        otherwise using local position in NED.
         """
-        # Save NED->up altitude
-        self.altitude_lpos_m = -float(msg.z)
+        if self.use_rangefinder and self.alt_range_m is not None:
+            self.alt_valid = True
+            return self.alt_range_m
 
-        # If we don't have rangefinder, use local position altitude
-        if self.altitude_m is None:
-            self.altitude_m = self.altitude_lpos_m
+        if self.alt_lpos_m is not None:
+            self.alt_valid = True
+            return self.alt_lpos_m
 
-    def get_altitude_m(self) -> float | None:
-        """
-        Choose the altitude source:
-          - Prefer rangefinder if available (low alt hardware flights)
-          - Otherwise use local position (SITL, higher alt)
-        """
-        if self.altitude_m is not None:
-            return self.altitude_m
-        if self.altitude_lpos_m is not None:
-            return self.altitude_lpos_m
+        self.alt_valid = False
         return None
 
     # -------------------------------------------------------------------------
-    # Helpers: time, mode, and commands
+    # Vehicle command helpers
     # -------------------------------------------------------------------------
 
-    def current_state_time(self) -> float:
-        dt_ns = (self.get_clock().now() - self.state_start_time).nanoseconds
-        return dt_ns * 1e-9
+    def send_vehicle_command(self,
+                             command: int,
+                             param1: float = 0.0,
+                             param2: float = 0.0,
+                             param3: float = 0.0,
+                             param4: float = 0.0,
+                             param5: float = 0.0,
+                             param6: float = 0.0,
+                             param7: float = 0.0):
+        msg = VehicleCommand()
+        msg.timestamp = int(self.now().nanoseconds / 1000)
 
-    def publish_offboard_control_mode(self):
+        msg.command = command
+        msg.param1 = float(param1)
+        msg.param2 = float(param2)
+        msg.param3 = float(param3)
+        msg.param4 = float(param4)
+        msg.param5 = float(param5)
+        msg.param6 = float(param6)
+        msg.param7 = float(param7)
+
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+
+        self.vehicle_command_pub.publish(msg)
+
+    def send_offboard_mode(self):
+        self.get_logger().info('Sending OFFBOARD mode command.')
+        # VEHICLE_CMD_DO_SET_MODE: param1=1 (MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+        # param2=6 (PX4_CUSTOM_MAIN_MODE_OFFBOARD)
+        self.send_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+            param1=1.0,
+            param2=6.0
+        )
+
+    def send_arm(self):
+        self.get_logger().info('Sending ARM command.')
+        self.send_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+            param1=1.0
+        )
+
+    def send_disarm(self):
+        self.get_logger().info('Sending DISARM command.')
+        self.send_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+            param1=0.0
+        )
+
+    # -------------------------------------------------------------------------
+    # Offboard control mode / setpoint publishers
+    # -------------------------------------------------------------------------
+
+    def publish_offboard_control_mode_velocity(self):
         msg = OffboardControlMode()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
+        msg.timestamp = int(self.now().nanoseconds / 1000)
 
-        # Choose control mode based on state
-        if self.state in ['PRE_OFFBOARD', 'TAKEOFF', 'ALT_HOLD',
-                          'ALT_TUNING', 'DESCEND']:
-            msg.position = False
-            msg.velocity = True    # vertical velocity
-            msg.acceleration = False
-            msg.attitude = False
-            msg.body_rate = False
+        msg.position = False
+        msg.velocity = True
+        msg.acceleration = False
+        msg.attitude = False
+        msg.body_rate = False
+        msg.thrust_and_torque = False
+        msg.direct_actuator = False
 
-        elif self.state in ['ATT_TUNING']:
-            msg.position = False
-            msg.velocity = False
-            msg.acceleration = False
-            msg.attitude = True    # attitude setpoints
-            msg.body_rate = False
+        self.offboard_control_mode_pub.publish(msg)
 
-        elif self.state in ['DONE']:
-            # neutral, but still publish something
-            msg.position = False
-            msg.velocity = True
-            msg.acceleration = False
-            msg.attitude = False
-            msg.body_rate = False
+    def publish_offboard_control_mode_attitude(self):
+        msg = OffboardControlMode()
+        msg.timestamp = int(self.now().nanoseconds / 1000)
+
+        msg.position = False
+        msg.velocity = False
+        msg.acceleration = False
+        msg.attitude = True   # Attitude mode
+        msg.body_rate = False
+        msg.thrust_and_torque = False
+        msg.direct_actuator = False
 
         self.offboard_control_mode_pub.publish(msg)
 
     def publish_trajectory_setpoint(self, vz_ned: float):
         msg = TrajectorySetpoint()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
+        msg.timestamp = int(self.now().nanoseconds / 1000)
 
-        # Position: don't control position -> NaN
         msg.position = [math.nan, math.nan, math.nan]
-
-        # Velocity: (vx, vy, vz) in NED
-        # zero horizontal, only vertical
         msg.velocity = [0.0, 0.0, float(vz_ned)]
-
-        # We’re not using acceleration / jerk here (set to NaN)
         msg.acceleration = [math.nan, math.nan, math.nan]
-        msg.jerk = [math.nan, math.nan, math.nan]
-
-        # Yaw: keep 0 (aligned with default forward)
+        msg.jerk = [0.0, 0.0, 0.0]
         msg.yaw = 0.0
         msg.yawspeed = 0.0
 
         self.trajectory_setpoint_pub.publish(msg)
 
-
-    def publish_attitude_setpoint(self, roll: float, pitch: float,
-                                  yaw: float, thrust_norm: float):
-        msg = VehicleAttitudeSetpoint()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
-
-        # Convert RPY -> quaternion (w, x, y, z), NED/FRD convention (PX4 Hamilton) :contentReference[oaicite:2]{index=2}
-        qw, qx, qy, qz = self.rpy_to_quaternion(roll, pitch, yaw)
-        msg.q_d[0] = qw
-        msg.q_d[1] = qx
-        msg.q_d[2] = qy
-        msg.q_d[3] = qz
-
-        msg.yaw_sp_move_rate = 0.0
-
-        # thrust_body: [0, 0, negative_thrust] for multicopters (upwards) :contentReference[oaicite:3]{index=3}
-        msg.thrust_body[0] = 0.0
-        msg.thrust_body[1] = 0.0
-        msg.thrust_body[2] = -float(thrust_norm)
-
-        self.attitude_setpoint_pub.publish(msg)
+    # -------------------------------------------------------------------------
+    # Attitude setpoint for tuning
+    # -------------------------------------------------------------------------
 
     @staticmethod
-    def rpy_to_quaternion(roll: float, pitch: float, yaw: float):
-        """Convert roll, pitch, yaw to quaternion (w, x, y, z)."""
+    def euler_to_quaternion(roll: float, pitch: float, yaw: float):
+        """
+        Converts roll, pitch, yaw (rad) to quaternion [w, x, y, z].
+        """
         cy = math.cos(yaw * 0.5)
         sy = math.sin(yaw * 0.5)
         cp = math.cos(pitch * 0.5)
@@ -268,244 +373,253 @@ class G34FirstFlightNode(Node):
         cr = math.cos(roll * 0.5)
         sr = math.sin(roll * 0.5)
 
-        qw = cr * cp * cy + sr * sp * sy
-        qx = sr * cp * cy - cr * sp * sy
-        qy = cr * sp * cy + sr * cp * sy
-        qz = cr * cp * sy - sr * sp * cy
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
+        return [w, x, y, z]
 
-        return qw, qx, qy, qz
+    def publish_attitude_setpoint(self,
+                                  roll_rad: float,
+                                  pitch_rad: float,
+                                  yaw_rad: float,
+                                  thrust_norm: float):
+        """
+        Publish a VehicleAttitudeSetpoint for attitude tuning.
+        thrust_norm in [0,1]; thrust_body[2] is negative throttle demand for MC.
+        """
+        msg = VehicleAttitudeSetpoint()
+        msg.timestamp = int(self.now().nanoseconds / 1000)
 
-    def arm(self):
-        self.get_logger().info('Sending ARM command.')
-        cmd = VehicleCommand()
-        cmd.timestamp = self.get_clock().now().nanoseconds // 1000
-        cmd.param1 = 1.0  # 1 = arm, 0 = disarm
-        cmd.command = VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM
-        cmd.target_system = 1
-        cmd.target_component = 1
-        cmd.source_system = 1
-        cmd.source_component = 1
-        cmd.from_external = True
-        self.vehicle_command_pub.publish(cmd)
+        msg.roll_body = roll_rad
+        msg.pitch_body = pitch_rad
+        msg.yaw_body = yaw_rad
+        msg.yaw_sp_move_rate = 0.0
 
-    def disarm(self):
-        self.get_logger().info('Sending DISARM command.')
-        cmd = VehicleCommand()
-        cmd.timestamp = self.get_clock().now().nanoseconds // 1000
-        cmd.param1 = 0.0  # 1 = arm, 0 = disarm
-        cmd.command = VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM
-        cmd.target_system = 1
-        cmd.target_component = 1
-        cmd.source_system = 1
-        cmd.source_component = 1
-        cmd.from_external = True
-        self.vehicle_command_pub.publish(cmd)        
-        
-    def set_offboard_mode(self):
-        self.get_logger().info('Sending OFFBOARD mode command.')
-        cmd = VehicleCommand()
-        cmd.timestamp = self.get_clock().now().nanoseconds // 1000
-        cmd.command = VehicleCommand.VEHICLE_CMD_DO_SET_MODE
-        cmd.param1 = 1.0  # main mode
+        msg.q_d = self.euler_to_quaternion(roll_rad, pitch_rad, yaw_rad)
 
-        cmd.param2 = 6.0  # PX4_CUSTOM_MAIN_MODE_OFFBOARD
-        cmd.target_system = 1
-        cmd.target_component = 1
-        cmd.source_system = 1
-        cmd.source_component = 1
-        cmd.from_external = True
-        self.vehicle_command_pub.publish(cmd)
-        
+        thrust_norm = max(0.0, min(1.0, thrust_norm))
+        msg.thrust_body = [0.0, 0.0, -thrust_norm]
+
+        msg.reset_integral = False
+
+        self.attitude_setpoint_pub.publish(msg)
 
     # -------------------------------------------------------------------------
-    # Vertical control
+    # Vertical control laws
     # -------------------------------------------------------------------------
 
-    def compute_vz_from_altitude_error(self, target_height_m: float) -> float:
+    def compute_vz_for_altitude_target(self, target_alt_up_m: float):
         """
-        P controller: altitude error (meters, up) -> vertical velocity (m/s, NED).
-
-        Uses get_altitude_m():
-          - Rangefinder when available
-          - Otherwise VehicleLocalPosition z
+        P controller: altitude error (upwards) -> vertical velocity (NED).
         """
-        alt = self.get_altitude_m()
-        if alt is None:
-            # No valid altitude yet: don't move
-            return 0.0
-
-        error_up = target_height_m - alt  # + if too low
-        v_up = self.altitude_kp * error_up
-        v_up = max(min(v_up, self.vert_speed_limit), -self.vert_speed_limit)
-
-        # Convert up velocity to NED z (down-positive)
-        vz_ned = -v_up
-        return vz_ned
-
-
-    # -------------------------------------------------------------------------
-    # Tuning sequences
-    # -------------------------------------------------------------------------
-
-    def run_altitude_tuning(self) -> float:
-        """
-        Simple altitude step sequence around takeoff height.
-
-        0-2s: base height
-        2-4s: +0.10 m
-        4-6s: -0.10 m
-        6-8s: base height
-        """
-        t = self.current_state_time()
-        base_h = self.takeoff_height
-
-        if t < 2.0:
-            target_h = base_h
-        elif t < 4.0:
-            target_h = base_h + 0.10
-        elif t < 6.0:
-            target_h = base_h - 0.10
-        elif t < 8.0:
-            target_h = base_h
+        alt_up = self.get_altitude_up_m()
+        if alt_up is None:
+            v_up = self.vz_max_up
+            err = float('nan')
         else:
-            target_h = base_h
-            self.alt_tuning_done = True
+            err = target_alt_up_m - alt_up
+            v_up_raw = self.altitude_kp * err
+            v_up = max(-self.vz_max_down, min(self.vz_max_up, v_up_raw))
 
-        return self.compute_vz_from_altitude_error(target_h)
+        vz_ned = -v_up  # up to NED (down-positive)
 
-    def run_attitude_tuning(self):
+        now_s = self.seconds_since_start()
+        if alt_up is not None and (now_s - self.last_debug_print_time) > 0.2:
+            phase_name = self.phase.name
+            self.get_logger().info(
+                f"[{phase_name}] alt_up={alt_up:.3f} m, "
+                f"target={target_alt_up_m:.3f} m, "
+                f"vz_ned={vz_ned:.3f} m/s"
+            )
+            self.last_debug_print_time = now_s
+
+        return vz_ned, alt_up, err
+
+    def compute_thrust_for_hover(self, target_alt_up_m: float):
         """
-        Attitude step sequence around hover attitude with constant thrust.
-
-        Time schedule:
-          0-2s:   level
-          2-4s:   +roll step
-          4-6s:   -roll step
-          6-8s:   level
-          8-10s:  +pitch step
-          10-12s: -pitch step
-          12-14s: level, then done
+        Simple hover thrust with small altitude correction for attitude tuning.
         """
-        t = self.current_state_time()
-        step_rad = math.radians(self.attitude_step_deg)
-
-        roll = 0.0
-        pitch = 0.0
-        yaw = 0.0
-
-        if t < 2.0:
-            roll, pitch = 0.0, 0.0
-        elif t < 4.0:
-            roll, pitch = step_rad, 0.0     # roll +
-        elif t < 6.0:
-            roll, pitch = -step_rad, 0.0    # roll -
-        elif t < 8.0:
-            roll, pitch = 0.0, 0.0
-        elif t < 10.0:
-            roll, pitch = 0.0, step_rad     # pitch +
-        elif t < 12.0:
-            roll, pitch = 0.0, -step_rad    # pitch -
-        elif t < 14.0:
-            roll, pitch = 0.0, 0.0
+        alt_up = self.get_altitude_up_m()
+        if alt_up is None:
+            thrust = self.hover_thrust
+            err = float('nan')
         else:
-            roll, pitch = 0.0, 0.0
-            self.att_tuning_done = True
+            err = target_alt_up_m - alt_up
+            thrust_raw = self.hover_thrust + self.altitude_kp_thrust * err
+            thrust = max(0.1, min(0.9, thrust_raw))
 
-        self.publish_attitude_setpoint(roll, pitch, yaw, self.hover_thrust_norm)
+        now_s = self.seconds_since_start()
+        if alt_up is not None and (now_s - self.last_debug_print_time) > 0.2:
+            phase_name = self.phase.name
+            self.get_logger().info(
+                f"[{phase_name}] alt_up={alt_up:.3f} m, "
+                f"target={target_alt_up_m:.3f} m, "
+                f"thrust={thrust:.3f}"
+            )
+            self.last_debug_print_time = now_s
+
+        return thrust, alt_up, err
 
     # -------------------------------------------------------------------------
-    # Main timer callback
+    # Main timer / state machine
     # -------------------------------------------------------------------------
 
     def timer_callback(self):
-        # Always send OffboardControlMode at high rate
-        self.publish_offboard_control_mode()
+        self.offboard_setpoint_counter += 1
 
-        # Default: hold vertical velocity at zero, unless state overrides
+        # Defaults
         vz_cmd_ned = 0.0
+        use_velocity_mode = True
+        roll_cmd = 0.0
+        pitch_cmd = 0.0
+        yaw_cmd = 0.0
+        thrust_cmd = self.hover_thrust
 
-        # PRE_OFFBOARD: stream neutral for ~1s, then switch to offboard + arm
-        if self.state == 'PRE_OFFBOARD':
-            self.offboard_setpoint_counter += 1
+        if self.phase == FlightPhase.PRE_OFFBOARD:
+            # Stream zeros; after ~1 second, send OFFBOARD + ARM and go to TAKEOFF
             vz_cmd_ned = 0.0
 
             if self.offboard_setpoint_counter == 50:
-                self.set_offboard_mode()
-                self.arm()
-                self.state = 'TAKEOFF'
-                self.state_start_time = self.get_clock().now()
+                self.send_offboard_mode()
+                self.send_arm()
+                self.phase = FlightPhase.TAKEOFF
+                self.state_start_time = self.now()
                 self.get_logger().info('PRE_OFFBOARD -> TAKEOFF')
 
-        elif self.state == 'TAKEOFF':
-            vz_cmd_ned = self.compute_vz_from_altitude_error(self.takeoff_height)
+        elif self.phase == FlightPhase.TAKEOFF:
+            vz_cmd_ned, alt_up, err = self.compute_vz_for_altitude_target(self.takeoff_height_m)
 
             if (
-                self.altitude_m is not None
-                and abs(self.altitude_m - self.takeoff_height) < 0.05
-                and self.current_state_time() > 1.0
+                alt_up is not None
+                and abs(self.takeoff_height_m - alt_up) < self.alt_tolerance_m
+                and self.seconds_since(self.state_start_time) > 1.0
             ):
-                self.state = 'ALT_HOLD'
-                self.state_start_time = self.get_clock().now()
+                self.phase = FlightPhase.ALT_HOLD
+                self.state_start_time = self.now()
                 self.get_logger().info('TAKEOFF -> ALT_HOLD')
 
-        elif self.state == 'ALT_HOLD':
-            # P altitude controller around takeoff height
-            vz_cmd_ned = self.compute_vz_from_altitude_error(self.takeoff_height)
+        elif self.phase == FlightPhase.ALT_HOLD:
+            vz_cmd_ned, alt_up, err = self.compute_vz_for_altitude_target(self.takeoff_height_m)
 
-            if self.current_state_time() > self.hover_time_s:
-                if self.run_altitude_tuning:
-                    self.state = 'ALT_TUNING'
-                    self.state_start_time = self.get_clock().now()
-                    self.alt_tuning_done = False
+            if self.seconds_since(self.state_start_time) > self.hover_time_s:
+                if self.enable_alt_tuning:
+                    self.phase = FlightPhase.ALT_TUNING
+                    self.state_start_time = self.now()
+                    self.alt_tuning_index = 0
                     self.get_logger().info('ALT_HOLD -> ALT_TUNING')
-                elif self.run_attitude_tuning:
-                    self.state = 'ATT_TUNING'
-                    self.state_start_time = self.get_clock().now()
-                    self.att_tuning_done = False
-                    self.get_logger().info('ALT_HOLD -> ATT_TUNING')
+                elif self.enable_att_tuning:
+                    self.phase = FlightPhase.ATT_TUNING_ROLL
+                    self.state_start_time = self.now()
+                    self.att_step_index = 0
+                    self.get_logger().info('ALT_HOLD -> ATT_TUNING_ROLL')
                 else:
-                    self.state = 'DESCEND'
-                    self.state_start_time = self.get_clock().now()
-                    self.get_logger().info('ALT_HOLD -> DESCEND')
+                    self.phase = FlightPhase.LAND
+                    self.state_start_time = self.now()
+                    self.get_logger().info('ALT_HOLD -> LAND')
 
-        elif self.state == 'ALT_TUNING':
-            vz_cmd_ned = self.run_altitude_tuning()
-            if self.alt_tuning_done:
-                if self.run_attitude_tuning:
-                    self.state = 'ATT_TUNING'
-                    self.state_start_time = self.get_clock().now()
-                    self.att_tuning_done = False
-                    self.get_logger().info('ALT_TUNING -> ATT_TUNING')
+        elif self.phase == FlightPhase.ALT_TUNING:
+            target = self.alt_tuning_targets[self.alt_tuning_index]
+            vz_cmd_ned, alt_up, err = self.compute_vz_for_altitude_target(target)
+
+            if self.seconds_since(self.state_start_time) > self.alt_tuning_step_time_s:
+                self.alt_tuning_index += 1
+                if self.alt_tuning_index >= len(self.alt_tuning_targets):
+                    if self.enable_att_tuning:
+                        self.phase = FlightPhase.ATT_TUNING_ROLL
+                        self.state_start_time = self.now()
+                        self.att_step_index = 0
+                        self.get_logger().info('ALT_TUNING -> ATT_TUNING_ROLL')
+                    else:
+                        self.phase = FlightPhase.LAND
+                        self.state_start_time = self.now()
+                        self.get_logger().info('ALT_TUNING -> LAND')
                 else:
-                    self.state = 'DESCEND'
-                    self.state_start_time = self.get_clock().now()
-                    self.get_logger().info('ALT_TUNING -> DESCEND')
+                    self.state_start_time = self.now()
+                    self.get_logger().info(
+                        f'ALT_TUNING: next target={self.alt_tuning_targets[self.alt_tuning_index]:.3f} m'
+                    )
 
-        elif self.state == 'ATT_TUNING':
-            # Here we control attitude directly (no vertical velocity command).
-            self.run_attitude_tuning()
-            if self.att_tuning_done:
-                self.state = 'DESCEND'
-                self.state_start_time = self.get_clock().now()
-                self.get_logger().info('ATT_TUNING -> DESCEND')
+        elif self.phase == FlightPhase.ATT_TUNING_ROLL:
+            use_velocity_mode = False  # attitude + thrust mode
+            thrust_cmd, alt_up, err = self.compute_thrust_for_hover(self.takeoff_height_m)
 
-        elif self.state == 'DESCEND':
-            vz_cmd_ned = self.compute_vz_from_altitude_error(self.descent_height)
+            if self.att_step_index >= len(self.roll_step_sequence):
+                # Done with roll steps
+                self.phase = FlightPhase.ATT_TUNING_PITCH
+                self.state_start_time = self.now()
+                self.att_step_index = 0
+                self.get_logger().info('ATT_TUNING_ROLL -> ATT_TUNING_PITCH')
+            else:
+                roll_cmd = self.roll_step_sequence[self.att_step_index]
+                pitch_cmd = 0.0
+                yaw_cmd = 0.0
 
-            if self.altitude_m is not None and self.altitude_m <= (self.descent_height + 0.02):
-                vz_cmd_ned = 0.0
-                self.disarm()
-                self.state = 'DONE'
-                self.state_start_time = self.get_clock().now()
-                self.get_logger().info('DESCEND -> DONE')
+                # Advance step after att_step_time_s
+                if self.seconds_since(self.state_start_time) > self.att_step_time_s:
+                    self.att_step_index += 1
+                    self.state_start_time = self.now()
+                    self.get_logger().info(
+                        f'ATT_TUNING_ROLL: step index -> {self.att_step_index}'
+                    )
 
-        elif self.state == 'DONE':
+        elif self.phase == FlightPhase.ATT_TUNING_PITCH:
+            use_velocity_mode = False
+            thrust_cmd, alt_up, err = self.compute_thrust_for_hover(self.takeoff_height_m)
+
+            if self.att_step_index >= len(self.pitch_step_sequence):
+                # Done with pitch steps
+                self.phase = FlightPhase.LAND
+                self.state_start_time = self.now()
+                self.get_logger().info('ATT_TUNING_PITCH -> LAND')
+            else:
+                roll_cmd = 0.0
+                pitch_cmd = self.pitch_step_sequence[self.att_step_index]
+                yaw_cmd = 0.0
+
+                if self.seconds_since(self.state_start_time) > self.att_step_time_s:
+                    self.att_step_index += 1
+                    self.state_start_time = self.now()
+                    self.get_logger().info(
+                        f'ATT_TUNING_PITCH: step index -> {self.att_step_index}'
+                    )
+
+        elif self.phase == FlightPhase.LAND:
+            # Simple constant descent
+            vz_cmd_ned = self.vz_max_down
+            alt_up = self.get_altitude_up_m()
+            if alt_up is not None:
+                now_s = self.seconds_since_start()
+                if (now_s - self.last_debug_print_time) > 0.2:
+                    self.get_logger().info(
+                        f"[LAND] alt_up={alt_up:.3f} m, vz_ned={vz_cmd_ned:.3f} m/s"
+                    )
+                    self.last_debug_print_time = now_s
+
+                if alt_up < 0.05:
+                    self.send_disarm()
+                    self.phase = FlightPhase.DONE
+                    self.state_start_time = self.now()
+                    self.get_logger().info('LAND -> DONE (disarmed)')
+
+        elif self.phase == FlightPhase.DONE:
             vz_cmd_ned = 0.0
 
-        # Only publish TrajectorySetpoint in velocity-based states
-        if self.state in ['PRE_OFFBOARD', 'TAKEOFF', 'ALT_HOLD',
-                          'ALT_TUNING', 'DESCEND', 'DONE']:
+        # ---------------------------------------------------------------------
+        # Publish OffboardControlMode + setpoints
+        # ---------------------------------------------------------------------
+
+        if use_velocity_mode:
+            self.publish_offboard_control_mode_velocity()
             self.publish_trajectory_setpoint(vz_cmd_ned)
+        else:
+            self.publish_offboard_control_mode_attitude()
+            self.publish_attitude_setpoint(
+                roll_cmd,
+                pitch_cmd,
+                yaw_cmd,
+                thrust_cmd
+            )
 
 
 def main(args=None):
@@ -514,11 +628,14 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info('Keyboard interrupt, shutting down G34 First Flight node.')
     finally:
-        node.get_logger().info('Shutting down G34 First Flight node.')
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
