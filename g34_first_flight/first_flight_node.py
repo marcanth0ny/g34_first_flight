@@ -193,6 +193,9 @@ class G34FirstFlightNode(Node):
         self.precision_land_client = None
         self.precision_land_future = None
 
+        # for manual log throttling
+        self._last_log_times = {}
+
         # --- Logging setup ---------------------------------------------------
         self.log_enabled = False
         self.log_file = None
@@ -264,6 +267,24 @@ class G34FirstFlightNode(Node):
     # -------------------------------------------------------------------------
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
+
+    def log_throttled(self, key: str, level: str, msg: str, period_s: float = 2.0):
+        """
+        Simple manual log throttling: log at most once per period_s for given key.
+        level: "info" or "warn" or "debug"
+        """
+        now = self._now()
+        last = self._last_log_times.get(key, None)
+        if last is not None and (now - last) < period_s:
+            return
+        self._last_log_times[key] = now
+
+        if level == "info":
+            self.get_logger().info(msg)
+        elif level == "warn":
+            self.get_logger().warn(msg)
+        else:
+            self.get_logger().debug(msg)
 
     def _setup_csv_logging(self):
         try:
@@ -538,9 +559,11 @@ class G34FirstFlightNode(Node):
         # --- PREFLIGHT: wait for position + attitude ------------------------
         if self.mission_phase == MissionPhase.PREFLIGHT:
             if self.last_local_position is None or self.last_attitude is None:
-                self.get_logger().throttle(
-                    2000,
+                self.log_throttled(
+                    "preflight_wait",
+                    "info",
                     "Waiting for local position and attitude...",
+                    period_s=2.0,
                 )
                 self._log_sample(now, cmd_z_ned, yaw_cmd)
                 return
@@ -570,9 +593,11 @@ class G34FirstFlightNode(Node):
             )
 
             dt = now - self.preoffboard_start_time
-            self.get_logger().throttle(
-                2000,
+            self.log_throttled(
+                "pre_offboard",
+                "info",
                 f"Phase=PRE_OFFBOARD, streaming setpoints for {dt:.1f} s",
+                period_s=1.0,
             )
 
             if dt >= self.preoffboard_stream_s:
@@ -624,9 +649,12 @@ class G34FirstFlightNode(Node):
                 self.takeoff_start_time is not None
                 and (now - self.takeoff_start_time) > self.takeoff_timeout_s
             ):
-                self.get_logger().warn(
+                self.log_throttled(
+                    "takeoff_timeout",
+                    "warn",
                     "TAKEOFF_ASCEND timeout reached; continuing but "
-                    "please verify altitude / thrust tuning."
+                    "please verify altitude / thrust tuning.",
+                    period_s=5.0,
                 )
 
             self._log_sample(now, cmd_z_ned, yaw_cmd)
@@ -734,10 +762,12 @@ class G34FirstFlightNode(Node):
             # Do NOT publish Offboard setpoints here; PX4 is handling descent.
             self.update_land_monitoring(now)
 
-            self.get_logger().throttle(
-                2000,
+            self.log_throttled(
+                "land_auto",
+                "info",
                 f"Phase=LAND_AUTO, alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
                 f"landed={landed}, disarm_sent={self.disarm_sent}",
+                period_s=2.0,
             )
 
             # Transition to DONE once disarm has been sent
@@ -775,10 +805,12 @@ class G34FirstFlightNode(Node):
 
             self.update_land_monitoring(now)
 
-            self.get_logger().throttle(
-                2000,
+            self.log_throttled(
+                "precision_land",
+                "info",
                 f"Phase=PRECISION_LAND, alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
                 f"landed={landed}, disarm_sent={self.disarm_sent}",
+                period_s=2.0,
             )
 
             if self.disarm_sent:
@@ -790,10 +822,11 @@ class G34FirstFlightNode(Node):
 
         # --- DONE: everything finished --------------------------------------
         if self.mission_phase == MissionPhase.DONE:
-            # No control, just logging every so often
-            self.get_logger().throttle(
-                5000,
+            self.log_throttled(
+                "done_state",
+                "info",
                 "Mission DONE. Node is idle; you can stop the launch when ready.",
+                period_s=5.0,
             )
             self._log_sample(now, cmd_z_ned, yaw_cmd)
             return
