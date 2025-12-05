@@ -12,6 +12,7 @@ from px4_msgs.msg import (
     TrajectorySetpoint,
     VehicleCommand,
     VehicleLocalPosition,
+    VehicleLandDetected,
 )
 
 
@@ -30,9 +31,7 @@ class G34FirstFlightNode(Node):
         # ---------------- Parameters ----------------
         self.declare_parameter('takeoff_height_m', 0.5)
         self.declare_parameter('altitude_tolerance_m', 0.05)
-        self.declare_parameter('takeoff_min_time_s', 1.5)       # must spend at least this long climbing
-        self.declare_parameter('takeoff_timeout_s', 8.0)        # max time before forcing HOVER
-        self.declare_parameter('position_hold_time_s', 5.0)     # time spent at hover height
+        self.declare_parameter('position_hold_time_s', 5.0)
         self.declare_parameter('offboard_warmup_setpoints', 20)
         self.declare_parameter('tuning_mode', 'none')           # 'none', 'altitude', 'attitude'
         self.declare_parameter('tuning_step_amplitude_m', 0.2)
@@ -41,8 +40,6 @@ class G34FirstFlightNode(Node):
 
         self.takeoff_height_m = float(self.get_parameter('takeoff_height_m').value)
         self.altitude_tolerance_m = float(self.get_parameter('altitude_tolerance_m').value)
-        self.takeoff_min_time_s = float(self.get_parameter('takeoff_min_time_s').value)
-        self.takeoff_timeout_s = float(self.get_parameter('takeoff_timeout_s').value)
         self.position_hold_time_s = float(self.get_parameter('position_hold_time_s').value)
         self.offboard_warmup_setpoints = int(self.get_parameter('offboard_warmup_setpoints').value)
         self.tuning_mode = str(self.get_parameter('tuning_mode').value).lower()
@@ -76,16 +73,22 @@ class G34FirstFlightNode(Node):
             self.local_position_callback,
             qos_px4,
         )
+        self.land_detected_sub = self.create_subscription(
+            VehicleLandDetected,
+            '/fmu/out/vehicle_land_detected',
+            self.land_detected_callback,
+            qos_px4,
+        )
 
         # ---------------- State variables ----------------
         self.flight_phase = FlightPhase.PREFLIGHT
         self.offboard_setpoint_counter = 0
 
         self.current_altitude_up = None  # meters, up-positive
+        self.landed = False              # from VehicleLandDetected
         self.last_altitude_print_time = 0.0
 
-        self.mission_start_time = None
-        self.hover_start_time = None
+        self.phase_start_time = None     # time when current phase began
 
         # Main loop timer (50 ms)
         self.dt = 0.05
@@ -99,9 +102,12 @@ class G34FirstFlightNode(Node):
     def local_position_callback(self, msg: VehicleLocalPosition):
         """
         PX4 local position: NED (z positive DOWN).
-        We always use -z as altitude up. No z_valid gating.
+        We always use -z as altitude up.
         """
         self.current_altitude_up = -msg.z
+
+    def land_detected_callback(self, msg: VehicleLandDetected):
+        self.landed = msg.landed
 
     # -------------------------------------------------------------------------
     # PX4 VehicleCommand helpers
@@ -153,7 +159,7 @@ class G34FirstFlightNode(Node):
 
     def publish_trajectory_setpoint(self, x_ned: float, y_ned: float, z_ned: float):
         """
-        Position-only setpoint; yaw is set to NaN so PX4 *does not change yaw*.
+        Position-only setpoint; yaw is NaN so PX4 *does not change yaw*.
         This minimizes initial yaw motion and keeps mission stable.
         """
         msg = TrajectorySetpoint()
@@ -231,12 +237,17 @@ class G34FirstFlightNode(Node):
             self.offboard_setpoint_counter += 1
             return
 
+        # Convenience: time in current phase
+        t_phase = 0.0
+        if self.phase_start_time is not None:
+            t_phase = now - self.phase_start_time
+
         # 2) After warmup: enter OFFBOARD and arm (once)
         if self.flight_phase == FlightPhase.PREFLIGHT:
             self.set_offboard_mode()
             self.arm()
             self.flight_phase = FlightPhase.TAKEOFF_ASCEND
-            self.mission_start_time = now
+            self.phase_start_time = now
             self.get_logger().info('PREFLIGHT -> TAKEOFF_ASCEND')
 
         # 3) Phase logic
@@ -244,25 +255,18 @@ class G34FirstFlightNode(Node):
             # Command target altitude; PX4 climbs to it
             z_cmd = -self.takeoff_height_m  # NED: up is negative
 
-            # Altitude-based transition with min-time + timeout safety
-            time_in_phase = now - (self.mission_start_time or now)
-            alt_ok = False
+            # Altitude-based transition ONLY (no time force to HOVER)
             if self.current_altitude_up is not None:
                 alt_err = abs(self.current_altitude_up - self.takeoff_height_m)
-                alt_ok = alt_err < self.altitude_tolerance_m
-
-            if (
-                alt_ok and time_in_phase > self.takeoff_min_time_s
-            ) or time_in_phase > self.takeoff_timeout_s:
-                self.flight_phase = FlightPhase.HOVER
-                self.hover_start_time = now
-                self.get_logger().info(
-                    f'TAKEOFF_ASCEND -> HOVER (time_in_phase={time_in_phase:.1f}s, alt_up='
-                    f'{self.current_altitude_up if self.current_altitude_up is not None else float("nan"):.2f} m)'
-                )
+                if self.current_altitude_up > 0.1 and alt_err < self.altitude_tolerance_m:
+                    self.flight_phase = FlightPhase.HOVER
+                    self.phase_start_time = now
+                    self.get_logger().info(
+                        f'TAKEOFF_ASCEND -> HOVER (alt_up={self.current_altitude_up:.2f} m)'
+                    )
 
         elif self.flight_phase == FlightPhase.HOVER:
-            t_hover = now - (self.hover_start_time or now)
+            t_hover = t_phase  # since phase_start_time is set entering HOVER
 
             # Start at nominal altitude
             alt_cmd = self.takeoff_height_m
@@ -280,17 +284,19 @@ class G34FirstFlightNode(Node):
             # After hold time, begin descent
             if t_hover > self.position_hold_time_s:
                 self.flight_phase = FlightPhase.DESCEND
+                self.phase_start_time = now
                 self.get_logger().info('HOVER -> DESCEND')
 
         elif self.flight_phase == FlightPhase.DESCEND:
             # Command back to “ground level” z=0 in NED
             z_cmd = 0.0
 
-            # Use altitude (if available) to decide when to disarm
-            if self.current_altitude_up is not None and self.current_altitude_up < 0.05:
+            # Use PX4's own land detector for disarm condition
+            if self.landed:
                 self.disarm()
                 self.flight_phase = FlightPhase.DONE
-                self.get_logger().info('DESCEND -> DONE (disarmed)')
+                self.phase_start_time = now
+                self.get_logger().info('DESCEND -> DONE (landed + disarmed)')
 
         elif self.flight_phase == FlightPhase.DONE:
             # Keep commanding ground position so PX4 stays happy in Offboard
@@ -312,7 +318,7 @@ class G34FirstFlightNode(Node):
             )
             self.get_logger().info(
                 f'Phase={self.flight_phase.name}, '
-                f'cmd_z_ned={z_cmd:.3f} m, alt_up={alt_str}'
+                f'cmd_z_ned={z_cmd:.3f} m, alt_up={alt_str}, landed={self.landed}'
             )
             self.last_altitude_print_time = now
 
