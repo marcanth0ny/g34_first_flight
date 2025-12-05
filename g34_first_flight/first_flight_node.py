@@ -1,433 +1,294 @@
 #!/usr/bin/env python3
-import math
 import os
 import csv
+import math
 from enum import Enum, auto
 from datetime import datetime
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from px4_msgs.msg import (
+    VehicleCommand,
     OffboardControlMode,
     TrajectorySetpoint,
-    VehicleCommand,
     VehicleLocalPosition,
+    VehicleControlMode,
     VehicleStatus,
     VehicleLandDetected,
-    VehicleAttitude,
 )
 
-from std_srvs.srv import Trigger
-
-
-class MissionPhase(Enum):
+# -------------------------------------------------------------------------
+#  Simple phase enum for the mission state machine
+# -------------------------------------------------------------------------
+class Phase(Enum):
     PREFLIGHT = auto()
-    PRE_OFFBOARD = auto()
     TAKEOFF_ASCEND = auto()
     HOVER = auto()
     ALT_TUNING = auto()
     ATT_TUNING = auto()
-    LAND_AUTO = auto()
-    PRECISION_LAND = auto()
+    FINAL_DESCEND = auto()
+    FINAL_AUTO_LAND = auto()
+    FINAL_PREC_LAND = auto()
     DONE = auto()
 
 
+# -------------------------------------------------------------------------
+#  Main node
+# -------------------------------------------------------------------------
 class G34FirstFlightNode(Node):
     def __init__(self):
         super().__init__("g34_first_flight_node")
-        self.get_logger().info("G34 First Flight node initialized.")
 
-        # --- Parameters ------------------------------------------------------
+        # ------------- Parameters ------------------------------------------------
+        # Topic for local position (SITL vs hardware)
         self.local_position_topic = (
             self.declare_parameter(
-                "local_position_topic",
-                "/fmu/out/vehicle_local_position_v1"
+                "local_position_topic", "/fmu/out/vehicle_local_position"
             )
             .get_parameter_value()
             .string_value
         )
 
-        self.attitude_topic = (
-            self.declare_parameter(
-                "attitude_topic",
-                "/fmu/out/vehicle_attitude"
-            )
-            .get_parameter_value()
-            .string_value
-        )
-
-        self.vehicle_status_topic = (
-            self.declare_parameter(
-                "vehicle_status_topic",
-                "/fmu/out/vehicle_status_v1"
-            )
-            .get_parameter_value()
-            .string_value
-        )
-
-        self.land_detected_topic = (
-            self.declare_parameter(
-                "land_detected_topic",
-                "/fmu/out/vehicle_land_detected"
-            )
-            .get_parameter_value()
-            .string_value
-        )
-
-        self.takeoff_altitude_m = (
+        # Takeoff altitude (m, positive up)
+        raw_takeoff_alt = (
             self.declare_parameter("takeoff_altitude_m", 0.5)
             .get_parameter_value()
             .double_value
         )
+        # Clamp to a safe range (0.3–2.0 m)
+        self.takeoff_altitude_m = max(0.3, min(raw_takeoff_alt, 2.0))
 
+        # Hover duration at takeoff altitude (s)
         self.hover_duration_s = (
-            self.declare_parameter("hover_duration_s", 10.0)
+            self.declare_parameter("hover_duration_s", 5.0)
             .get_parameter_value()
             .double_value
         )
 
-        self.preoffboard_stream_s = (
-            self.declare_parameter("preoffboard_stream_s", 2.0)
+        # Pre-offboard streaming duration (s)
+        self.preoffboard_duration_s = (
+            self.declare_parameter("preoffboard_duration_s", 1.0)
             .get_parameter_value()
             .double_value
         )
 
+        # Tuning mode: none / altitude / attitude / both
+        raw_tuning_mode = (
+            self.declare_parameter("tuning_mode", "none")
+            .get_parameter_value()
+            .string_value
+        )
+        self.tuning_mode = raw_tuning_mode.strip().lower()
+        valid_tuning_modes = ("none", "altitude", "attitude", "both")
+        if self.tuning_mode not in valid_tuning_modes:
+            self.get_logger().warn(
+                f"Invalid tuning_mode '{raw_tuning_mode}', defaulting to 'none'. "
+                f"Valid options: {valid_tuning_modes}"
+            )
+            self.tuning_mode = "none"
+
+        # Final mode after hover/tuning: descend / auto_land / pl_precision
+        raw_final_mode = (
+            self.declare_parameter("final_mode", "descend")
+            .get_parameter_value()
+            .string_value
+        )
+        self.final_mode = raw_final_mode.strip().lower()
+        valid_final_modes = ("descend", "auto_land", "pl_precision")
+        if self.final_mode not in valid_final_modes:
+            self.get_logger().warn(
+                f"Invalid final_mode '{raw_final_mode}', defaulting to 'descend'. "
+                f"Valid options: {valid_final_modes}"
+            )
+            self.final_mode = "descend"
+
+        # Altitude tuning parameters
+        self.alt_step_amplitude_m = (
+            self.declare_parameter("alt_step_amplitude_m", 0.15)
+            .get_parameter_value()
+            .double_value
+        )
+        self.alt_step_period_s = (
+            self.declare_parameter("alt_step_period_s", 5.0)
+            .get_parameter_value()
+            .double_value
+        )
+        self.tuning_duration_s = (
+            self.declare_parameter("tuning_duration_s", 30.0)
+            .get_parameter_value()
+            .double_value
+        )
+
+        # Attitude tuning parameters: simple yaw steps
+        self.att_step_deg = (
+            self.declare_parameter("att_step_deg", 5.0)
+            .get_parameter_value()
+            .double_value
+        )
+        self.att_step_period_s = (
+            self.declare_parameter("att_step_period_s", 5.0)
+            .get_parameter_value()
+            .double_value
+        )
+
+        # Takeoff ascend timeout (s) – safety
         self.takeoff_timeout_s = (
             self.declare_parameter("takeoff_timeout_s", 20.0)
             .get_parameter_value()
             .double_value
         )
 
-        self.post_land_latched_wait_s = (
-            self.declare_parameter("post_land_latched_wait_s", 3.0)
-            .get_parameter_value()
-            .double_value
-        )
-
-        # Tuning modes: "none", "altitude_step", "attitude_step"
-        self.tuning_mode = (
-            self.declare_parameter("tuning_mode", "none")
+        # Log directory for CSV
+        raw_log_dir = (
+            self.declare_parameter("log_directory", "~/g34_logs")
             .get_parameter_value()
             .string_value
         )
+        self.log_directory = os.path.expanduser(raw_log_dir)
 
-        # Altitude step tuning
-        self.alt_step_amplitude_m = (
-            self.declare_parameter("alt_step_amplitude_m", 0.1)
-            .get_parameter_value()
-            .double_value
-        )
-        self.alt_step_period_s = (
-            self.declare_parameter("alt_step_period_s", 4.0)
-            .get_parameter_value()
-            .double_value
+        self.get_logger().info(
+            f"tuning_mode='{self.tuning_mode}', final_mode='{self.final_mode}', "
+            f"takeoff_altitude_m={self.takeoff_altitude_m:.2f} m"
         )
 
-        # Attitude (yaw) step tuning
-        self.att_step_deg = (
-            self.declare_parameter("att_step_deg", 10.0)
-            .get_parameter_value()
-            .double_value
+        # ------------- Publishers / Subscribers ----------------------------------
+        # Command interface to PX4
+        self.vehicle_command_pub = self.create_publisher(
+            VehicleCommand, "/fmu/in/vehicle_command", 10
         )
-        self.att_step_period_s = (
-            self.declare_parameter("att_step_period_s", 4.0)
-            .get_parameter_value()
-            .double_value
-        )
-
-        self.tuning_duration_s = (
-            self.declare_parameter("tuning_duration_s", 20.0)
-            .get_parameter_value()
-            .double_value
-        )
-
-        # Final mode: "auto_land" or "precision_land"
-        self.final_mode = (
-            self.declare_parameter("final_mode", "auto_land")
-            .get_parameter_value()
-            .string_value
-        )
-
-        # Precision landing service (Tracktor-Beam)
-        self.precision_land_service_name = (
-            self.declare_parameter(
-                "precision_land_service_name",
-                "/tracktor_beam/start"
-            )
-            .get_parameter_value()
-            .string_value
-        )
-
-        # CSV logging
-        self.log_directory = (
-            self.declare_parameter("log_directory", "")
-            .get_parameter_value()
-            .string_value
-        )
-        if not self.log_directory:
-            self.log_directory = os.path.expanduser("~/g34_logs")
-
-        # --- Internal state --------------------------------------------------
-        self.mission_phase = MissionPhase.PREFLIGHT
-
-        self.last_local_position = None
-        self.last_attitude = None
-        self.last_vehicle_status = None
-        self.last_land_detected = None
-
-        self.yaw_ref = None
-        self.x_hold_ned = None
-        self.y_hold_ned = None
-
-        self.preoffboard_start_time = None
-        self.takeoff_start_time = None
-        self.hover_start_time = None
-        self.tuning_start_time = None
-
-        self.land_command_sent = False
-        self.landed_latch_time = None
-        self.disarm_sent = False
-
-        self.precision_land_client = None
-        self.precision_land_future = None
-
-        # for manual log throttling
-        self._last_log_times = {}
-
-        # --- Logging setup ---------------------------------------------------
-        self.log_enabled = False
-        self.log_file = None
-        self.csv_writer = None
-        self._setup_csv_logging()
-
-        # --- QoS and comms ---------------------------------------------------
-        qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-
         self.offboard_control_mode_pub = self.create_publisher(
-            OffboardControlMode,
-            "/fmu/in/offboard_control_mode",
-            10,
+            OffboardControlMode, "/fmu/in/offboard_control_mode", 10
         )
         self.trajectory_setpoint_pub = self.create_publisher(
-            TrajectorySetpoint,
-            "/fmu/in/trajectory_setpoint",
-            10,
-        )
-        self.vehicle_command_pub = self.create_publisher(
-            VehicleCommand,
-            "/fmu/in/vehicle_command",
-            10,
+            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", 10
         )
 
+        # Feedback from PX4
         self.local_position_sub = self.create_subscription(
             VehicleLocalPosition,
             self.local_position_topic,
             self.local_position_callback,
-            qos,
+            10,
         )
-
-        self.attitude_sub = self.create_subscription(
-            VehicleAttitude,
-            self.attitude_topic,
-            self.attitude_callback,
-            qos,
+        self.vehicle_control_mode_sub = self.create_subscription(
+            VehicleControlMode,
+            "/fmu/out/vehicle_control_mode",
+            self.vehicle_control_mode_callback,
+            10,
         )
-
         self.vehicle_status_sub = self.create_subscription(
             VehicleStatus,
-            self.vehicle_status_topic,
+            "/fmu/out/vehicle_status",
             self.vehicle_status_callback,
-            qos,
+            10,
         )
-
         self.land_detected_sub = self.create_subscription(
             VehicleLandDetected,
-            self.land_detected_topic,
+            "/fmu/out/vehicle_land_detected",
             self.land_detected_callback,
-            qos,
+            10,
         )
 
-        # Precision landing service client (optional)
-        self.precision_land_client = self.create_client(
-            Trigger, self.precision_land_service_name
+        # ------------- Internal state -------------------------------------------
+        self.phase = Phase.PREFLIGHT
+        self.phase_start_time = None
+
+        self.offboard_started = False
+        self.offboard_start_time = None
+
+        self.base_yaw_rad = 0.0  # yaw at takeoff, used as reference for attitude tuning
+
+        self.local_position_msg = None
+        self.vehicle_control_mode_msg = None
+        self.vehicle_status_msg = None
+        self.land_detected_msg = None
+
+        self.alt_tuning_center_m = self.takeoff_altitude_m
+        self.did_alt_tuning_in_both = False
+
+        self.final_mode_started = False
+        self.sent_disarm_cmd = False
+
+        # For simple log throttling
+        self.last_hover_log_time = 0.0
+        self.last_done_log_time = 0.0
+
+        # ------------- CSV logging setup ----------------------------------------
+        os.makedirs(self.log_directory, exist_ok=True)
+        time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.csv_path = os.path.join(
+            self.log_directory, f"g34_first_flight_{time_str}.csv"
         )
+        self.csv_file = open(self.csv_path, "w", newline="")
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(
+            [
+                "t_ros_s",
+                "phase",
+                "alt_up_m",
+                "vz_ned_mps",
+                "cmd_alt_up_m",
+                "cmd_z_ned_m",
+                "yaw_cmd_rad",
+                "tuning_mode",
+                "final_mode",
+                "landed_flag",
+                "arming_state",
+            ]
+        )
+        self.get_logger().info(f"CSV logging enabled: {self.csv_path}")
 
-        # Main 10 Hz timer
-        self.timer_period = 0.1
-        self.timer = self.create_timer(self.timer_period, self.timer_callback)
+        # ------------- Timer -----------------------------------------------------
+        # 20 Hz timer: drives state machine and offboard setpoints
+        self.timer_dt = 0.05
+        self.timer = self.create_timer(self.timer_dt, self.timer_callback)
+
+        self.get_logger().info("G34 First Flight node initialized.")
 
     # -------------------------------------------------------------------------
-    # Helpers
+    #  Helpers for time / msg utilities
     # -------------------------------------------------------------------------
-    def _now(self) -> float:
+    def now_s(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
 
-    def log_throttled(self, key: str, level: str, msg: str, period_s: float = 2.0):
-        """
-        Simple manual log throttling: log at most once per period_s for given key.
-        level: "info" or "warn" or "debug"
-        """
-        now = self._now()
-        last = self._last_log_times.get(key, None)
-        if last is not None and (now - last) < period_s:
-            return
-        self._last_log_times[key] = now
+    def now_us(self) -> int:
+        return int(self.get_clock().now().nanoseconds / 1000)
 
-        if level == "info":
-            self.get_logger().info(msg)
-        elif level == "warn":
-            self.get_logger().warn(msg)
-        else:
-            self.get_logger().debug(msg)
-
-    def _setup_csv_logging(self):
-        try:
-            os.makedirs(self.log_directory, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_path = os.path.join(
-                self.log_directory, f"g34_first_flight_{ts}.csv"
-            )
-            self.log_file = open(log_path, "w", newline="")
-            self.csv_writer = csv.writer(self.log_file)
-            self.csv_writer.writerow(
-                [
-                    "t",
-                    "phase",
-                    "tuning_mode",
-                    "final_mode",
-                    "alt_up_m",
-                    "vz_ned_mps",
-                    "yaw_rad",
-                    "cmd_z_ned_m",
-                    "yaw_cmd_rad",
-                    "landed_flag",
-                    "nav_state",
-                    "arming_state",
-                ]
-            )
-            self.log_enabled = True
-            self.get_logger().info(f"CSV logging enabled: {log_path}")
-        except Exception as e:
-            self.get_logger().warn(f"Failed to set up CSV logging: {e}")
-            self.log_enabled = False
-
-    def _log_sample(self, t, cmd_z_ned, yaw_cmd):
-        if not self.log_enabled:
-            return
-
-        alt_up, vz_ned, landed = self._get_alt_vz_landed()
-        yaw = None
-        if self.last_attitude is not None:
-            yaw = self._quat_to_yaw(self.last_attitude.q)
-
-        nav_state = None
-        arming_state = None
-        if self.last_vehicle_status is not None:
-            nav_state = self.last_vehicle_status.nav_state
-            arming_state = self.last_vehicle_status.arming_state
-
-        row = [
-            f"{t:.3f}",
-            self.mission_phase.name,
-            self.tuning_mode,
-            self.final_mode,
-            f"{alt_up:.3f}" if alt_up is not None else "",
-            f"{vz_ned:.3f}" if vz_ned is not None else "",
-            f"{yaw:.3f}" if yaw is not None else "",
-            f"{cmd_z_ned:.3f}" if cmd_z_ned is not None else "",
-            f"{yaw_cmd:.3f}" if yaw_cmd is not None else "",
-            "1" if landed else "0" if landed is not None else "",
-            f"{nav_state}" if nav_state is not None else "",
-            f"{arming_state}" if arming_state is not None else "",
-        ]
-
-        try:
-            self.csv_writer.writerow(row)
-            self.log_file.flush()
-        except Exception as e:
-            self.get_logger().warn(f"CSV write failed: {e}")
-            self.log_enabled = False
-
-    def _get_alt_vz_landed(self):
-        alt_up = None
-        vz_ned = None
-        landed = None
-
-        if self.last_local_position is not None:
-            # PX4 NED frame: z is down, so altitude up = -z
-            alt_up = -self.last_local_position.z
-            vz_ned = self.last_local_position.vz
-
-        if self.last_land_detected is not None:
-            landed = bool(self.last_land_detected.landed)
-
-        return alt_up, vz_ned, landed
-
-    @staticmethod
-    def _quat_to_yaw(q):
-        # q = [w, x, y, z]
-        if len(q) != 4:
-            return 0.0
-        w, x, y, z = q
-        siny_cosp = 2.0 * (w * z + x * y)
-        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-        return math.atan2(siny_cosp, cosy_cosp)
+    def current_phase_name(self) -> str:
+        return self.phase.name
 
     # -------------------------------------------------------------------------
-    # ROS Callbacks
+    #  Subscribers
     # -------------------------------------------------------------------------
     def local_position_callback(self, msg: VehicleLocalPosition):
-        self.last_local_position = msg
+        self.local_position_msg = msg
 
-    def attitude_callback(self, msg: VehicleAttitude):
-        self.last_attitude = msg
-        if self.yaw_ref is None:
-            yaw = self._quat_to_yaw(msg.q)
-            self.yaw_ref = yaw
-            self.get_logger().info(f"Yaw reference locked at {self.yaw_ref:.3f} rad")
+    def vehicle_control_mode_callback(self, msg: VehicleControlMode):
+        self.vehicle_control_mode_msg = msg
 
     def vehicle_status_callback(self, msg: VehicleStatus):
-        self.last_vehicle_status = msg
+        self.vehicle_status_msg = msg
 
     def land_detected_callback(self, msg: VehicleLandDetected):
-        self.last_land_detected = msg
+        self.land_detected_msg = msg
 
     # -------------------------------------------------------------------------
-    # Publishing helpers
+    #  PX4 command helpers
     # -------------------------------------------------------------------------
-    def publish_offboard_control_mode(self):
-        msg = OffboardControlMode()
-        msg.timestamp = int(self._now() * 1e6)
-        msg.position = True
-        msg.velocity = False
-        msg.acceleration = False
-        msg.attitude = False
-        msg.body_rate = False
-        msg.thrust_and_torque = False
-        msg.direct_actuator = False
-        self.offboard_control_mode_pub.publish(msg)
-
-    def publish_trajectory_setpoint(self, x_ned, y_ned, z_ned, yaw_cmd):
-        msg = TrajectorySetpoint()
-        msg.timestamp = int(self._now() * 1e6)
-        msg.position = [float(x_ned), float(y_ned), float(z_ned)]
-        msg.velocity = [0.0, 0.0, 0.0]
-        msg.acceleration = [0.0, 0.0, 0.0]
-        msg.yaw = float(yaw_cmd)
-        self.trajectory_setpoint_pub.publish(msg)
-
     def send_vehicle_command(
-        self, command, param1=0.0, param2=0.0, param3=0.0,
-        param4=0.0, param5=0.0, param6=0.0, param7=0.0
+        self,
+        command: int,
+        param1: float = 0.0,
+        param2: float = 0.0,
+        param3: float = 0.0,
+        param4: float = 0.0,
+        param5: float = 0.0,
+        param6: float = 0.0,
+        param7: float = 0.0,
     ):
         msg = VehicleCommand()
-        msg.timestamp = int(self._now() * 1e6)
+        msg.timestamp = self.now_us()
         msg.param1 = float(param1)
         msg.param2 = float(param2)
         msg.param3 = float(param3)
@@ -443,414 +304,545 @@ class G34FirstFlightNode(Node):
         msg.from_external = True
         self.vehicle_command_pub.publish(msg)
 
-    def send_offboard_mode_command(self):
-        # MAV_CMD_DO_SET_MODE: base_mode=1 (custom mode), main=6 (Offboard)
+    def arm(self):
+        self.get_logger().info("Sending ARM command.")
+        self.send_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+            param1=float(VehicleCommand.ARMING_ACTION_ARM),
+        )
+
+    def disarm(self):
+        self.get_logger().info("Sending DISARM command.")
+        self.send_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+            param1=float(VehicleCommand.ARMING_ACTION_DISARM),
+        )
+
+    def set_offboard_mode(self):
+        # Uses VEHICLE_CMD_DO_SET_MODE to request PX4 OFFBOARD
+        # MAV_MODE: base_mode, custom_mode not strictly needed here; but we use
+        # PX4's custom command for nav state in other paths.
+        self.get_logger().info("Sending OFFBOARD mode command.")
         self.send_vehicle_command(
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
-            param1=1.0,   # base mode: MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-            param2=6.0,   # main mode: Offboard
-            param3=0.0,   # submode not used here
+            param1=1.0,  # base_mode: MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+            param2=6.0,  # custom_main_mode: PX4_MAIN_MODE_OFFBOARD
+            param3=0.0,
         )
-        self.get_logger().info("Sending OFFBOARD mode command.")
 
-    def send_arm_command(self):
-        self.send_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
-            param1=1.0,
-        )
-        self.get_logger().info("Sending ARM command.")
-
-    def send_disarm_command(self):
-        self.send_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
-            param1=0.0,
-        )
-        self.get_logger().info("Sending DISARM command.")
-
-    def send_land_command(self):
-        # Land at current location, PX4 handles descent + touchdown detection
-        self.send_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_NAV_LAND,
-            # params left at 0 => land at current position
-        )
-        self.get_logger().info("Sending NAV_LAND command (PX4 auto-land).")
+    def set_auto_land_mode(self):
+        # Simplest: use NAV_LAND and let PX4 handle final landing.
+        self.get_logger().info("Sending NAV_LAND command (AUTO LAND).")
+        self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
 
     # -------------------------------------------------------------------------
-    # Precision landing handoff (Tracktor-Beam)
+    #  Offboard publishers
     # -------------------------------------------------------------------------
-    def start_precision_landing(self, now):
-        if self.precision_land_client is None:
-            self.get_logger().warn(
-                "Precision landing client not created; falling back to auto_land."
-            )
-            self.send_land_command()
-            self.land_command_sent = True
-            self.mission_phase = MissionPhase.LAND_AUTO
+    def publish_offboard_control_mode(self):
+        msg = OffboardControlMode()
+        msg.timestamp = self.now_us()
+        # We are using position control in XYZ, yaw controlled via TrajectorySetpoint.yaw
+        msg.position = True
+        msg.velocity = False
+        msg.acceleration = False
+        msg.attitude = False
+        msg.body_rate = False
+        self.offboard_control_mode_pub.publish(msg)
+
+    def publish_trajectory_setpoint(self, x_ned: float, y_ned: float, z_ned: float, yaw_rad: float):
+        msg = TrajectorySetpoint()
+        msg.timestamp = self.now_us()
+        # Position NED
+        msg.position[0] = float(x_ned)
+        msg.position[1] = float(y_ned)
+        msg.position[2] = float(z_ned)
+        # Zero velocity/accel; PX4 position controller fills in
+        msg.velocity[0] = 0.0
+        msg.velocity[1] = 0.0
+        msg.velocity[2] = 0.0
+        msg.yaw = float(yaw_rad)
+        self.trajectory_setpoint_pub.publish(msg)
+
+    def publish_trajectory_setpoint_z(self, z_ned: float, yaw_rad: float = None):
+        # Keep XY at 0, just move in Z
+        if yaw_rad is None:
+            yaw_rad = self.base_yaw_rad
+        self.publish_trajectory_setpoint(0.0, 0.0, z_ned, yaw_rad)
+
+    # -------------------------------------------------------------------------
+    #  Altitude / velocity extraction from VehicleLocalPosition
+    # -------------------------------------------------------------------------
+    def get_altitude_and_vz(self):
+        """
+        Returns (alt_up_m, vz_ned_mps, valid)
+        alt_up_m: altitude above home (positive up)
+        vz_ned_mps: vertical velocity in NED (down positive)
+        """
+        if self.local_position_msg is None:
+            return (None, None, False)
+
+        # PX4 local position is NED: z is down, so altitude up is -z.
+        alt_up_m = -self.local_position_msg.z
+        vz_ned = self.local_position_msg.vz
+        return (alt_up_m, vz_ned, True)
+
+    def is_landed(self) -> bool:
+        if self.land_detected_msg is None:
+            return False
+        return bool(self.land_detected_msg.landed)
+
+    def is_armed(self) -> bool:
+        if self.vehicle_status_msg is None:
+            return False
+        return self.vehicle_status_msg.arming_state == VehicleStatus.ARMING_STATE_ARMED
+
+    # -------------------------------------------------------------------------
+    #  CSV logging
+    # -------------------------------------------------------------------------
+    def log_row(self, t_ros_s, cmd_z_ned_m, cmd_alt_up_m):
+        phase_name = self.current_phase_name()
+        alt_up_m, vz_ned, valid = self.get_altitude_and_vz()
+        landed_flag = self.is_landed()
+        arming_state = (
+            self.vehicle_status_msg.arming_state if self.vehicle_status_msg else -1
+        )
+
+        self.csv_writer.writerow(
+            [
+                f"{t_ros_s:.3f}",
+                phase_name,
+                f"{alt_up_m:.4f}" if valid else "nan",
+                f"{vz_ned:.4f}" if valid else "nan",
+                f"{cmd_alt_up_m:.4f}" if cmd_alt_up_m is not None else "nan",
+                f"{cmd_z_ned_m:.4f}" if cmd_z_ned_m is not None else "nan",
+                f"{self.base_yaw_rad:.4f}",
+                self.tuning_mode,
+                self.final_mode,
+                int(landed_flag),
+                int(arming_state),
+            ]
+        )
+        # keep file flushed; this is small enough for our use
+        self.csv_file.flush()
+
+    # -------------------------------------------------------------------------
+    #  Start final mode helper
+    # -------------------------------------------------------------------------
+    def start_final_mode(self, now_s: float):
+        if self.final_mode_started:
             return
 
-        # Try once to see if service is there; non-blocking wait
-        if not self.precision_land_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn(
-                "Precision landing service not available; falling back to auto_land."
+        self.final_mode_started = True
+
+        if self.final_mode == "descend":
+            self.get_logger().info("Starting FINAL_DESCEND mode.")
+            self.phase = Phase.FINAL_DESCEND
+            self.phase_start_time = now_s
+
+        elif self.final_mode == "auto_land":
+            self.get_logger().info("Starting FINAL_AUTO_LAND mode.")
+            self.set_auto_land_mode()
+            self.phase = Phase.FINAL_AUTO_LAND
+            self.phase_start_time = now_s
+
+        elif self.final_mode == "pl_precision":
+            # TODO: once Tracktor Beam / mode executor integration is wired,
+            # this is where you'd send the appropriate mode request or start
+            # their precision-landing mode. For now, fall back to auto_land.
+            self.get_logger().info(
+                "final_mode='pl_precision' requested, "
+                "but precision-landing mode integration is not yet configured. "
+                "Falling back to AUTO LAND."
             )
-            self.send_land_command()
-            self.land_command_sent = True
-            self.mission_phase = MissionPhase.LAND_AUTO
-            return
+            self.set_auto_land_mode()
+            self.phase = Phase.FINAL_AUTO_LAND
+            self.phase_start_time = now_s
 
-        req = Trigger.Request()
-        self.precision_land_future = self.precision_land_client.call_async(req)
-        self.get_logger().info(
-            f"Precision landing service '{self.precision_land_service_name}' called."
-        )
-        # From this point, Tracktor-Beam should own Offboard setpoints.
-        self.mission_phase = MissionPhase.PRECISION_LAND
-
-    # -------------------------------------------------------------------------
-    # Land monitoring (used both for LAND_AUTO and PRECISION_LAND)
-    # -------------------------------------------------------------------------
-    def update_land_monitoring(self, now: float):
-        _, _, landed = self._get_alt_vz_landed()
-
-        if landed:
-            if self.landed_latch_time is None:
-                self.landed_latch_time = now
-                self.get_logger().info(
-                    "Landing detected (VehicleLandDetected.landed=True), "
-                    "starting post-land timer."
-                )
-        # We *do not* reset latch if landed becomes False again; we want a
-        # monotonic progression to disarm once we see landed at least once.
-
-        if (
-            self.landed_latch_time is not None
-            and not self.disarm_sent
-            and (now - self.landed_latch_time) >= self.post_land_latched_wait_s
-        ):
-            self.send_disarm_command()
-            self.disarm_sent = True
-
-    # -------------------------------------------------------------------------
-    # Mission control
-    # -------------------------------------------------------------------------
-    def start_final_mode(self, now: float):
-        """
-        Called once when HOVER / tuning is complete to start the landing phase.
-        """
-        if self.final_mode == "precision_land":
-            self.get_logger().info("Starting precision landing handoff.")
-            self.start_precision_landing(now)
         else:
-            # Default: PX4 auto-land
-            self.get_logger().info("Starting PX4 auto-land.")
-            self.send_land_command()
-            self.land_command_sent = True
-            self.mission_phase = MissionPhase.LAND_AUTO
+            # Should not reach here, but in case of typo:
+            self.get_logger().warn(
+                f"Unknown final_mode='{self.final_mode}', defaulting to FINAL_DESCEND."
+            )
+            self.phase = Phase.FINAL_DESCEND
+            self.phase_start_time = now_s
 
     # -------------------------------------------------------------------------
-    # Main timer (10 Hz)
+    #  Main timer callback (state machine)
     # -------------------------------------------------------------------------
     def timer_callback(self):
-        now = self._now()
-        alt_up, vz_ned, landed = self._get_alt_vz_landed()
-        yaw_cmd = self.yaw_ref if self.yaw_ref is not None else 0.0
-        cmd_z_ned = None  # what we send this cycle (if any)
+        t = self.now_s()
 
-        # --- PREFLIGHT: wait for position + attitude ------------------------
-        if self.mission_phase == MissionPhase.PREFLIGHT:
-            if self.last_local_position is None or self.last_attitude is None:
-                self.log_throttled(
-                    "preflight_wait",
-                    "info",
-                    "Waiting for local position and attitude...",
-                    period_s=2.0,
-                )
-                self._log_sample(now, cmd_z_ned, yaw_cmd)
-                return
+        # Always publish OffboardControlMode – PX4 expects high-rate stream
+        self.publish_offboard_control_mode()
 
-            # Lock x,y at current local position; start pre-offboard streaming
-            self.x_hold_ned = self.last_local_position.x
-            self.y_hold_ned = self.last_local_position.y
-            if self.yaw_ref is None:
-                self.yaw_ref = self._quat_to_yaw(self.last_attitude.q)
+        # Default commanded altitude/setpoint for logging
+        cmd_alt_up_m = None
+        cmd_z_ned = None
 
-            self.preoffboard_start_time = now
-            self.mission_phase = MissionPhase.PRE_OFFBOARD
-            self.get_logger().info(
-                f"PREFLIGHT -> PRE_OFFBOARD (x_hold={self.x_hold_ned:.2f}, "
-                f"y_hold={self.y_hold_ned:.2f}, yaw_ref={self.yaw_ref:.2f})"
-            )
+        # PREFLIGHT: stream neutral setpoints while we wait to enter OFFBOARD
+        if self.phase == Phase.PREFLIGHT:
+            if self.phase_start_time is None:
+                self.phase_start_time = t
+                self.offboard_start_time = t
+                self.get_logger().info("Phase=PREFLIGHT (pre-offboard streaming).")
 
-        # --- PRE_OFFBOARD: stream setpoints before mode switch --------------
-        if self.mission_phase == MissionPhase.PRE_OFFBOARD:
-            # Hold just above ground (small negative z)
-            z_ned_pre = -0.05
-            cmd_z_ned = z_ned_pre
+            # Neutral setpoint near ground
+            self.publish_trajectory_setpoint_z(0.0)
+            cmd_z_ned = 0.0
+            cmd_alt_up_m = 0.0
 
-            self.publish_offboard_control_mode()
-            self.publish_trajectory_setpoint(
-                self.x_hold_ned, self.y_hold_ned, cmd_z_ned, yaw_cmd
-            )
+            elapsed = t - self.phase_start_time
 
-            dt = now - self.preoffboard_start_time
-            self.log_throttled(
-                "pre_offboard",
-                "info",
-                f"Phase=PRE_OFFBOARD, streaming setpoints for {dt:.1f} s",
-                period_s=1.0,
-            )
+            # After a brief pre-offboard period, request OFFBOARD + ARM
+            if not self.offboard_started and elapsed >= self.preoffboard_duration_s:
+                self.set_offboard_mode()
+                self.arm()
+                self.offboard_started = True
+                self.offboard_start_time = t
+                self.base_yaw_rad = 0.0  # could be replaced with actual yaw
 
-            if dt >= self.preoffboard_stream_s:
-                self.send_offboard_mode_command()
-                self.send_arm_command()
-                self.takeoff_start_time = now
-                self.mission_phase = MissionPhase.TAKEOFF_ASCEND
-                self.get_logger().info("PRE_OFFBOARD -> TAKEOFF_ASCEND")
+            # Once offboard and armed, transition to TAKEOFF_ASCEND
+            if (
+                self.offboard_started
+                and self.is_armed()
+                and self.vehicle_control_mode_msg
+                and self.vehicle_control_mode_msg.flag_control_offboard_enabled
+            ):
+                self.phase = Phase.TAKEOFF_ASCEND
+                self.phase_start_time = t
+                self.get_logger().info("PREFLIGHT -> TAKEOFF_ASCEND")
 
-            self._log_sample(now, cmd_z_ned, yaw_cmd)
-            return
+        # TAKEOFF_ASCEND: climb to takeoff_altitude_m (NED z negative)
+        elif self.phase == Phase.TAKEOFF_ASCEND:
+            if self.phase_start_time is None:
+                self.phase_start_time = t
 
-        # --- TAKEOFF_ASCEND: rise to takeoff_altitude_m ---------------------
-        if self.mission_phase == MissionPhase.TAKEOFF_ASCEND:
-            if self.x_hold_ned is None or self.yaw_ref is None:
-                # Something went wrong; revert to PREFLIGHT
-                self.get_logger().warn(
-                    "Missing x_hold or yaw_ref in TAKEOFF_ASCEND, reverting to PREFLIGHT."
-                )
-                self.mission_phase = MissionPhase.PREFLIGHT
-                self._log_sample(now, cmd_z_ned, yaw_cmd)
-                return
+            cmd_alt_up_m = self.takeoff_altitude_m
+            cmd_z_ned = -self.takeoff_altitude_m
+            self.publish_trajectory_setpoint_z(cmd_z_ned)
 
-            target_alt = self.takeoff_altitude_m
-            cmd_z_ned = -target_alt
+            alt_up, vz_ned, valid = self.get_altitude_and_vz()
+            landed_flag = self.is_landed()
+            elapsed = t - self.phase_start_time
 
-            self.publish_offboard_control_mode()
-            self.publish_trajectory_setpoint(
-                self.x_hold_ned, self.y_hold_ned, cmd_z_ned, yaw_cmd
-            )
-
-            self.get_logger().info(
-                f"Phase=TAKEOFF_ASCEND, cmd_z_ned={cmd_z_ned:+.3f} m, "
-                f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
-                f"landed={landed}"
-            )
-
-            # Check if we've reached altitude
-            if alt_up is not None and alt_up >= 0.9 * target_alt:
-                self.hover_start_time = now
-                self.mission_phase = MissionPhase.HOVER
+            if valid:
                 self.get_logger().info(
-                    f"TAKEOFF_ASCEND -> HOVER "
-                    f"(alt_up={alt_up:.2f} m, target={target_alt:.2f} m)"
+                    f"Phase=TAKEOFF_ASCEND, cmd_z_ned={cmd_z_ned:.3f} m, "
+                    f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, landed={landed_flag}"
                 )
 
-            # Timeout safety
-            if (
-                self.takeoff_start_time is not None
-                and (now - self.takeoff_start_time) > self.takeoff_timeout_s
-            ):
-                self.log_throttled(
-                    "takeoff_timeout",
-                    "warn",
-                    "TAKEOFF_ASCEND timeout reached; continuing but "
-                    "please verify altitude / thrust tuning.",
-                    period_s=5.0,
-                )
-
-            self._log_sample(now, cmd_z_ned, yaw_cmd)
-            return
-
-        # --- HOVER: hold altitude and yaw for a fixed duration --------------
-        if self.mission_phase == MissionPhase.HOVER:
-            target_alt = self.takeoff_altitude_m
-            cmd_z_ned = -target_alt
-
-            self.publish_offboard_control_mode()
-            self.publish_trajectory_setpoint(
-                self.x_hold_ned, self.y_hold_ned, cmd_z_ned, yaw_cmd
+            # Transition to HOVER when close enough to target altitude OR timeout
+            altitude_reached = valid and (
+                abs(alt_up - self.takeoff_altitude_m) <= 0.05
             )
-
-            dt_hover = now - self.hover_start_time
-            self.get_logger().info(
-                f"Phase=HOVER, t={dt_hover:.1f} s, cmd_z_ned={cmd_z_ned:+.3f} m, "
-                f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s"
-            )
-
-            if dt_hover >= self.hover_duration_s:
-                if self.tuning_mode == "altitude_step":
-                    self.tuning_start_time = now
-                    self.mission_phase = MissionPhase.ALT_TUNING
-                    self.get_logger().info("HOVER -> ALT_TUNING")
-                elif self.tuning_mode == "attitude_step":
-                    self.tuning_start_time = now
-                    self.mission_phase = MissionPhase.ATT_TUNING
-                    self.get_logger().info("HOVER -> ATT_TUNING")
-                else:
-                    self.get_logger().info("HOVER complete, starting final mode.")
-                    self.start_final_mode(now)
-
-            self._log_sample(now, cmd_z_ned, yaw_cmd)
-            return
-
-        # --- ALTITUDE TUNING: step alt around hover -------------------------
-        if self.mission_phase == MissionPhase.ALT_TUNING:
-            target_alt = self.takeoff_altitude_m
-            amp = max(min(self.alt_step_amplitude_m, 0.5 * target_alt), 0.02)
-            period = max(self.alt_step_period_s, 1.0)
-
-            phase_t = (now - self.tuning_start_time) % period
-            if phase_t < period / 2.0:
-                alt_cmd = target_alt + amp / 2.0
-            else:
-                alt_cmd = target_alt - amp / 2.0
-                alt_cmd = max(alt_cmd, 0.2)  # keep some margin above ground
-
-            cmd_z_ned = -alt_cmd
-            self.publish_offboard_control_mode()
-            self.publish_trajectory_setpoint(
-                self.x_hold_ned, self.y_hold_ned, cmd_z_ned, yaw_cmd
-            )
-
-            dt_tuning = now - self.tuning_start_time
-            self.get_logger().info(
-                f"Phase=ALT_TUNING, t={dt_tuning:.1f} s, alt_cmd={alt_cmd:.3f} m, "
-                f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s"
-            )
-
-            if dt_tuning >= self.tuning_duration_s:
-                self.get_logger().info("ALT_TUNING complete, starting final mode.")
-                self.start_final_mode(now)
-
-            self._log_sample(now, cmd_z_ned, yaw_cmd)
-            return
-
-        # --- ATTITUDE (YAW) TUNING -----------------------------------------
-        if self.mission_phase == MissionPhase.ATT_TUNING:
-            target_alt = self.takeoff_altitude_m
-            cmd_z_ned = -target_alt
-
-            # yaw step around yaw_ref
-            yaw_step_rad = math.radians(self.att_step_deg)
-            period = max(self.att_step_period_s, 1.0)
-            phase_t = (now - self.tuning_start_time) % period
-
-            if phase_t < period / 2.0:
-                yaw_cmd = self.yaw_ref + yaw_step_rad
-            else:
-                yaw_cmd = self.yaw_ref - yaw_step_rad
-
-            self.publish_offboard_control_mode()
-            self.publish_trajectory_setpoint(
-                self.x_hold_ned, self.y_hold_ned, cmd_z_ned, yaw_cmd
-            )
-
-            dt_tuning = now - self.tuning_start_time
-            self.get_logger().info(
-                f"Phase=ATT_TUNING, t={dt_tuning:.1f} s, yaw_cmd={yaw_cmd:.3f} rad, "
-                f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s"
-            )
-
-            if dt_tuning >= self.tuning_duration_s:
-                self.get_logger().info("ATT_TUNING complete, starting final mode.")
-                self.start_final_mode(now)
-
-            self._log_sample(now, cmd_z_ned, yaw_cmd)
-            return
-
-        # --- LAND_AUTO: PX4 auto-land & disarm ------------------------------
-        if self.mission_phase == MissionPhase.LAND_AUTO:
-            # Do NOT publish Offboard setpoints here; PX4 is handling descent.
-            self.update_land_monitoring(now)
-
-            self.log_throttled(
-                "land_auto",
-                "info",
-                f"Phase=LAND_AUTO, alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
-                f"landed={landed}, disarm_sent={self.disarm_sent}",
-                period_s=2.0,
-            )
-
-            # Transition to DONE once disarm has been sent
-            if self.disarm_sent:
-                self.mission_phase = MissionPhase.DONE
-                self.get_logger().info("LAND_AUTO complete -> DONE")
-
-            self._log_sample(now, cmd_z_ned, yaw_cmd)
-            return
-
-        # --- PRECISION_LAND: Tracktor-Beam owns Offboard --------------------
-        if self.mission_phase == MissionPhase.PRECISION_LAND:
-            # We do not publish Offboard setpoints here; Tracktor-Beam does.
-            # Just monitor landing and disarm.
-            if (
-                self.precision_land_future is not None
-                and self.precision_land_future.done()
-            ):
-                try:
-                    resp = self.precision_land_future.result()
-                    if resp.success:
-                        self.get_logger().info(
-                            f"Precision landing service reports success: {resp.message}"
-                        )
-                    else:
-                        self.get_logger().warn(
-                            f"Precision landing service reports failure: {resp.message}"
-                        )
-                except Exception as e:
+            if altitude_reached or elapsed >= self.takeoff_timeout_s:
+                if not altitude_reached:
                     self.get_logger().warn(
-                        f"Precision landing service call failed: {e}"
+                        f"TAKEOFF_ASCEND timeout reached (elapsed={elapsed:.1f}s). "
+                        f"alt_up={alt_up:.3f} m (target={self.takeoff_altitude_m:.3f} m)"
+                        if valid
+                        else "TAKEOFF_ASCEND timeout reached, but no valid altitude."
                     )
-                finally:
-                    self.precision_land_future = None
+                self.phase = Phase.HOVER
+                self.phase_start_time = t
+                self.get_logger().info("TAKEOFF_ASCEND -> HOVER")
 
-            self.update_land_monitoring(now)
+        # HOVER: hold takeoff altitude for hover_duration_s
+        elif self.phase == Phase.HOVER:
+            if self.phase_start_time is None:
+                self.phase_start_time = t
 
-            self.log_throttled(
-                "precision_land",
-                "info",
-                f"Phase=PRECISION_LAND, alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
-                f"landed={landed}, disarm_sent={self.disarm_sent}",
-                period_s=2.0,
-            )
+            cmd_alt_up_m = self.takeoff_altitude_m
+            cmd_z_ned = -self.takeoff_altitude_m
+            self.publish_trajectory_setpoint_z(cmd_z_ned)
 
-            if self.disarm_sent:
-                self.mission_phase = MissionPhase.DONE
-                self.get_logger().info("PRECISION_LAND complete -> DONE")
+            alt_up, vz_ned, valid = self.get_altitude_and_vz()
+            hover_elapsed = t - self.phase_start_time
 
-            self._log_sample(now, cmd_z_ned, yaw_cmd)
-            return
+            # Lightly throttled logging (once per ~1 s)
+            if hover_elapsed - self.last_hover_log_time > 1.0:
+                self.last_hover_log_time = hover_elapsed
+                if valid:
+                    self.get_logger().info(
+                        f"Phase=HOVER, hover_elapsed={hover_elapsed:.1f}s, "
+                        f"alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
+                        f"tuning_mode={self.tuning_mode}"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"Phase=HOVER, hover_elapsed={hover_elapsed:.1f}s, "
+                        f"tuning_mode={self.tuning_mode}, alt_up=N/A"
+                    )
 
-        # --- DONE: everything finished --------------------------------------
-        if self.mission_phase == MissionPhase.DONE:
-            self.log_throttled(
-                "done_state",
-                "info",
-                "Mission DONE. Node is idle; you can stop the launch when ready.",
-                period_s=5.0,
-            )
-            self._log_sample(now, cmd_z_ned, yaw_cmd)
-            return
+            # Decide next phase once hover time is done
+            if hover_elapsed >= self.hover_duration_s:
+                if self.tuning_mode == "altitude":
+                    self.get_logger().info(
+                        f"HOVER -> ALT_TUNING (hover_elapsed={hover_elapsed:.1f}s)"
+                    )
+                    self.phase = Phase.ALT_TUNING
+                    self.phase_start_time = t
+                    self.alt_tuning_center_m = self.takeoff_altitude_m
+
+                elif self.tuning_mode == "attitude":
+                    self.get_logger().info(
+                        f"HOVER -> ATT_TUNING (hover_elapsed={hover_elapsed:.1f}s)"
+                    )
+                    self.phase = Phase.ATT_TUNING
+                    self.phase_start_time = t
+
+                elif self.tuning_mode == "both":
+                    self.get_logger().info(
+                        "HOVER -> ALT_TUNING (both; starting with altitude)"
+                    )
+                    self.phase = Phase.ALT_TUNING
+                    self.phase_start_time = t
+                    self.alt_tuning_center_m = self.takeoff_altitude_m
+                    self.did_alt_tuning_in_both = False
+
+                else:
+                    # No tuning requested – go straight to final mode
+                    self.get_logger().info(
+                        f"HOVER -> final_mode='{self.final_mode}' (no tuning requested)"
+                    )
+                    self.start_final_mode(t)
+
+        # ALT_TUNING: altitude step tests around center
+        elif self.phase == Phase.ALT_TUNING:
+            if self.phase_start_time is None:
+                self.phase_start_time = t
+
+            tuning_elapsed = t - self.phase_start_time
+
+            # Done with altitude tuning?
+            if tuning_elapsed >= self.tuning_duration_s:
+                if self.tuning_mode == "both" and not self.did_alt_tuning_in_both:
+                    self.get_logger().info("ALT_TUNING complete -> ATT_TUNING (both).")
+                    self.did_alt_tuning_in_both = True
+                    self.phase = Phase.ATT_TUNING
+                    self.phase_start_time = t
+                else:
+                    self.get_logger().info(
+                        f"ALT_TUNING complete -> final_mode='{self.final_mode}'"
+                    )
+                    self.start_final_mode(t)
+                cmd_z_ned = None
+                cmd_alt_up_m = None
+            else:
+                # Step index based on period
+                step_index = int(tuning_elapsed / self.alt_step_period_s)
+                center = self.alt_tuning_center_m
+
+                if step_index % 2 == 0:
+                    alt_cmd_m = center + self.alt_step_amplitude_m
+                else:
+                    alt_cmd_m = center - self.alt_step_amplitude_m
+
+                cmd_alt_up_m = alt_cmd_m
+                cmd_z_ned = -alt_cmd_m
+                self.publish_trajectory_setpoint_z(cmd_z_ned)
+
+                self.get_logger().info(
+                    f"Phase=ALT_TUNING, t={tuning_elapsed:.1f}s, step_index={step_index}, "
+                    f"alt_cmd={alt_cmd_m:.3f} m"
+                )
+
+        # ATT_TUNING: simple yaw step tests around base_yaw_rad
+        elif self.phase == Phase.ATT_TUNING:
+            if self.phase_start_time is None:
+                self.phase_start_time = t
+
+            tuning_elapsed = t - self.phase_start_time
+
+            # Done with attitude tuning?
+            if tuning_elapsed >= self.tuning_duration_s:
+                if self.tuning_mode == "both" and not self.did_alt_tuning_in_both:
+                    # Should not normally happen, but keep logic symmetric:
+                    self.get_logger().info("ATT_TUNING complete -> ALT_TUNING (both).")
+                    self.did_alt_tuning_in_both = True
+                    self.phase = Phase.ALT_TUNING
+                    self.phase_start_time = t
+                else:
+                    self.get_logger().info(
+                        f"ATT_TUNING complete -> final_mode='{self.final_mode}'"
+                    )
+                    self.start_final_mode(t)
+                cmd_z_ned = None
+                cmd_alt_up_m = None
+            else:
+                # Keep altitude near takeoff_altitude
+                alt_cmd_m = self.takeoff_altitude_m
+                cmd_alt_up_m = alt_cmd_m
+                cmd_z_ned = -alt_cmd_m
+
+                # Yaw step pattern
+                step_index = int(tuning_elapsed / self.att_step_period_s)
+                yaw_step_rad = math.radians(self.att_step_deg)
+                if step_index % 2 == 0:
+                    yaw_cmd = self.base_yaw_rad + yaw_step_rad
+                else:
+                    yaw_cmd = self.base_yaw_rad - yaw_step_rad
+
+                self.publish_trajectory_setpoint(0.0, 0.0, cmd_z_ned, yaw_cmd)
+
+                self.get_logger().info(
+                    f"Phase=ATT_TUNING, t={tuning_elapsed:.1f}s, step_index={step_index}, "
+                    f"yaw_cmd={yaw_cmd:.3f} rad, alt_cmd={alt_cmd_m:.3f} m"
+                )
+
+        # FINAL_DESCEND: offboard-controlled descent to ground (z_ned -> 0)
+        elif self.phase == Phase.FINAL_DESCEND:
+            if self.phase_start_time is None:
+                self.phase_start_time = t
+
+            # Command altitude up = 0 (ground)
+            cmd_alt_up_m = 0.0
+            cmd_z_ned = 0.0
+            self.publish_trajectory_setpoint_z(cmd_z_ned)
+
+            alt_up, vz_ned, valid = self.get_altitude_and_vz()
+            landed_flag = self.is_landed()
+
+            if valid:
+                self.get_logger().info(
+                    f"Phase=FINAL_DESCEND, alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
+                    f"landed={landed_flag}"
+                )
+            else:
+                self.get_logger().info(
+                    f"Phase=FINAL_DESCEND, alt_up=N/A, landed={landed_flag}"
+                )
+
+            # If PX4's land detector says we're landed, disarm & go DONE
+            if landed_flag and not self.sent_disarm_cmd:
+                self.disarm()
+                self.sent_disarm_cmd = True
+                self.phase_start_time = t  # reuse as disarm_wait_start
+
+            # After disarm command, wait a bit then mark DONE
+            if self.sent_disarm_cmd and (t - self.phase_start_time) > 2.0:
+                self.phase = Phase.DONE
+                self.get_logger().info("FINAL_DESCEND -> DONE (landed & disarm requested).")
+
+        # FINAL_AUTO_LAND: PX4 handles landing after NAV_LAND; we just monitor
+        elif self.phase == Phase.FINAL_AUTO_LAND:
+            if self.phase_start_time is None:
+                self.phase_start_time = t
+
+            # Keep streaming neutral offboard setpoint close to current position
+            alt_up, vz_ned, valid = self.get_altitude_and_vz()
+            if valid:
+                cmd_alt_up_m = alt_up
+                cmd_z_ned = -alt_up
+                self.publish_trajectory_setpoint_z(cmd_z_ned)
+            else:
+                cmd_alt_up_m = None
+                cmd_z_ned = None
+
+            landed_flag = self.is_landed()
+
+            if valid:
+                self.get_logger().info(
+                    f"Phase=FINAL_AUTO_LAND, alt_up={alt_up:.3f} m, vz_ned={vz_ned:.3f} m/s, "
+                    f"landed={landed_flag}"
+                )
+            else:
+                self.get_logger().info(
+                    f"Phase=FINAL_AUTO_LAND, alt_up=N/A, landed={landed_flag}"
+                )
+
+            # When PX4 says we're landed, request disarm and go DONE
+            if landed_flag and not self.sent_disarm_cmd:
+                self.disarm()
+                self.sent_disarm_cmd = True
+                self.phase_start_time = t
+
+            if self.sent_disarm_cmd and (t - self.phase_start_time) > 2.0:
+                self.phase = Phase.DONE
+                self.get_logger().info("FINAL_AUTO_LAND -> DONE (landed & disarm requested).")
+
+        # FINAL_PREC_LAND: currently just an alias for FINAL_AUTO_LAND path
+        elif self.phase == Phase.FINAL_PREC_LAND:
+            # For now we do the same as FINAL_AUTO_LAND; once you know the exact
+            # Tracktor Beam mode / service call, you can split this out.
+            if self.phase_start_time is None:
+                self.phase_start_time = t
+
+            alt_up, vz_ned, valid = self.get_altitude_and_vz()
+            if valid:
+                cmd_alt_up_m = alt_up
+                cmd_z_ned = -alt_up
+                self.publish_trajectory_setpoint_z(cmd_z_ned)
+            else:
+                cmd_alt_up_m = None
+                cmd_z_ned = None
+
+            landed_flag = self.is_landed()
+
+            if valid:
+                self.get_logger().info(
+                    f"Phase=FINAL_PREC_LAND (fallback auto), alt_up={alt_up:.3f} m, "
+                    f"vz_ned={vz_ned:.3f} m/s, landed={landed_flag}"
+                )
+            else:
+                self.get_logger().info(
+                    f"Phase=FINAL_PREC_LAND (fallback auto), alt_up=N/A, landed={landed_flag}"
+                )
+
+            if landed_flag and not self.sent_disarm_cmd:
+                self.disarm()
+                self.sent_disarm_cmd = True
+                self.phase_start_time = t
+
+            if self.sent_disarm_cmd and (t - self.phase_start_time) > 2.0:
+                self.phase = Phase.DONE
+                self.get_logger().info("FINAL_PREC_LAND -> DONE (landed & disarm requested).")
+
+        # DONE: mission over, keep node alive but neutral
+        elif self.phase == Phase.DONE:
+            # Neutral setpoint to avoid surprises:
+            self.publish_trajectory_setpoint_z(0.0)
+            cmd_alt_up_m = 0.0
+            cmd_z_ned = 0.0
+
+            # Throttle logging to ~1 Hz
+            if t - self.last_done_log_time > 1.0:
+                self.last_done_log_time = t
+                self.get_logger().info(
+                    "Phase=DONE (mission complete). You can Ctrl+C to stop the node."
+                )
+
+        # ---------------------------------------------------------------------
+        #  Log CSV row
+        # ---------------------------------------------------------------------
+        self.log_row(t, cmd_z_ned, cmd_alt_up_m)
 
     # -------------------------------------------------------------------------
-    # Shutdown
+    #  Cleanup
     # -------------------------------------------------------------------------
     def destroy_node(self):
         self.get_logger().info("Shutting down G34 First Flight node.")
         try:
-            if self.log_file is not None:
-                self.log_file.close()
+            self.csv_file.close()
         except Exception:
             pass
         super().destroy_node()
 
 
+# -------------------------------------------------------------------------
+#  main()
+# -------------------------------------------------------------------------
 def main(args=None):
     rclpy.init(args=args)
     node = G34FirstFlightNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("KeyboardInterrupt, shutting down.")
+        node.get_logger().info("Keyboard interrupt, shutting down.")
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
