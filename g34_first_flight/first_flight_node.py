@@ -116,7 +116,7 @@ class G34FirstFlightNode(Node):
     # -------------------------------------------------------------------------
     def publish_vehicle_command(self, command: int, param1: float = 0.0, param2: float = 0.0):
         msg = VehicleCommand()
-        msg.timestamp = self.get_clock().now().nanoseconds() // 1000
+        msg.timestamp = self.get_clock().now().nanoseconds // 1000
         msg.param1 = float(param1)
         msg.param2 = float(param2)
         msg.param3 = 0.0
@@ -150,7 +150,7 @@ class G34FirstFlightNode(Node):
     # -------------------------------------------------------------------------
     def publish_offboard_control_mode(self):
         msg = OffboardControlMode()
-        msg.timestamp = self.get_clock().now().nanoseconds() // 1000
+        msg.timestamp = self.get_clock().now().nanoseconds // 1000
         # Position-only Offboard (PX4 handles altitude & attitude)
         msg.position = True
         msg.velocity = False
@@ -161,7 +161,7 @@ class G34FirstFlightNode(Node):
 
     def publish_trajectory_setpoint(self, x_ned: float, y_ned: float, z_ned: float, yaw_rad: float):
         msg = TrajectorySetpoint()
-        msg.timestamp = self.get_clock().now().nanoseconds() // 1000
+        msg.timestamp = self.get_clock().now().nanoseconds // 1000
         msg.position = [float(x_ned), float(y_ned), float(z_ned)]
         # Use NaN for unused fields so PX4 ignores them
         msg.velocity = [math.nan, math.nan, math.nan]
@@ -224,7 +224,7 @@ class G34FirstFlightNode(Node):
     # Main loop
     # -------------------------------------------------------------------------
     def timer_callback(self):
-        now = self.get_clock().now().nanoseconds() / 1e9  # seconds
+        now = self.get_clock().now().nanoseconds / 1e9  # seconds
 
         # Always stream offboard heartbeat
         self.publish_offboard_control_mode()
