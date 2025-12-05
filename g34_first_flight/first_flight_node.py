@@ -13,6 +13,7 @@ from px4_msgs.msg import (
     DistanceSensor,
     VehicleAttitude,
     VehicleAttitudeSetpoint,
+    VehicleLocalPosition,
 )
 
 
@@ -68,6 +69,7 @@ class G34FirstFlightNode(Node):
         self.altitude_m = None
         self.vehicle_status = VehicleStatus()
         self.vehicle_attitude = VehicleAttitude()
+        self.altitude_lpos_m = None         # from VehicleLocalPosition (NED -> up)
 
         self.alt_tuning_done = False
         self.att_tuning_done = False
@@ -108,6 +110,13 @@ class G34FirstFlightNode(Node):
             qos_sensor,
         )
 
+        self.local_position_sub = self.create_subscription(
+            VehicleLocalPosition,
+            '/fmu/out/vehicle_local_position',
+            self.vehicle_local_position_callback,
+            qos_sensor,
+        )
+
         self.attitude_sub = self.create_subscription(
             VehicleAttitude,
             '/fmu/out/vehicle_attitude',
@@ -137,6 +146,36 @@ class G34FirstFlightNode(Node):
 
     def vehicle_attitude_callback(self, msg: VehicleAttitude):
         self.vehicle_attitude = msg
+    
+    def vehicle_local_position_callback(self, msg: VehicleLocalPosition):
+        """
+        Use PX4 local position as a fallback altitude source.
+
+        VehicleLocalPosition is in NED frame:
+          x: north (m)
+          y: east (m)
+          z: down (m, positive down)
+
+        We define altitude_m as "upwards from ground" -> -z.
+        """
+        # Save NED->up altitude
+        self.altitude_lpos_m = -float(msg.z)
+
+        # If we don't have rangefinder, use local position altitude
+        if self.altitude_m is None:
+            self.altitude_m = self.altitude_lpos_m
+
+    def get_altitude_m(self) -> float | None:
+        """
+        Choose the altitude source:
+          - Prefer rangefinder if available (low alt hardware flights)
+          - Otherwise use local position (SITL, higher alt)
+        """
+        if self.altitude_m is not None:
+            return self.altitude_m
+        if self.altitude_lpos_m is not None:
+            return self.altitude_lpos_m
+        return None
 
     # -------------------------------------------------------------------------
     # Helpers: time, mode, and commands
@@ -284,16 +323,25 @@ class G34FirstFlightNode(Node):
 
     def compute_vz_from_altitude_error(self, target_height_m: float) -> float:
         """
-        P controller: altitude error (in meters) -> vertical velocity (m/s, NED frame).
+        P controller: altitude error (meters, up) -> vertical velocity (m/s, NED).
+
+        Uses get_altitude_m():
+          - Rangefinder when available
+          - Otherwise VehicleLocalPosition z
         """
-        if self.altitude_m is None:
+        alt = self.get_altitude_m()
+        if alt is None:
+            # No valid altitude yet: don't move
             return 0.0
 
-        error_up = target_height_m - self.altitude_m  # + if too low
+        error_up = target_height_m - alt  # + if too low
         v_up = self.altitude_kp * error_up
         v_up = max(min(v_up, self.vert_speed_limit), -self.vert_speed_limit)
-        vz_ned = -v_up  # NED: +z down
+
+        # Convert up velocity to NED z (down-positive)
+        vz_ned = -v_up
         return vz_ned
+
 
     # -------------------------------------------------------------------------
     # Tuning sequences
