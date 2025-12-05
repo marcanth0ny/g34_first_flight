@@ -30,16 +30,16 @@ class G34FirstFlightNode(Node):
 
         # ---------------- Parameters ----------------
         self.declare_parameter('takeoff_height_m', 0.5)
-        self.declare_parameter('altitude_tolerance_m', 0.04)
+        self.declare_parameter('altitude_tolerance_m', 0.05)
         self.declare_parameter('takeoff_min_time_s', 1.5)        # must spend at least this long climbing
         self.declare_parameter('takeoff_timeout_s', 10.0)        # max time before we *force* HOVER
         self.declare_parameter('position_hold_time_s', 5.0)      # time spent at hover height
         self.declare_parameter('offboard_warmup_setpoints', 20)  # setpoints before OFFBOARD+ARM
 
         # Landing handling
-        self.declare_parameter('landing_altitude_thresh_m', 0.04)
+        self.declare_parameter('landing_altitude_thresh_m', 0.05)
         self.declare_parameter('landing_vz_thresh_mps', 0.10)
-        self.declare_parameter('landing_timeout_s', 10.0)
+        self.declare_parameter('landing_timeout_s', 15.0)
 
         # Optional tuning
         self.declare_parameter('tuning_mode', 'none')            # 'none', 'altitude', 'attitude'
