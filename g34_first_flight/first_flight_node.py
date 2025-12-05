@@ -177,14 +177,27 @@ class G34FirstFlightNode(Node):
         self.offboard_control_mode_pub.publish(msg)
 
     def publish_trajectory_setpoint(self, vz_ned: float):
+        
         msg = TrajectorySetpoint()
         msg.timestamp = self.get_clock().now().nanoseconds // 1000
-        msg.vx = 0.0
-        msg.vy = 0.0
-        msg.vz = float(vz_ned)
+
+        # Position: don't control position -> NaN
         msg.position = [math.nan, math.nan, math.nan]
+
+        # Velocity: (vx, vy, vz) in NED
+        # zero horizontal, only vertical
+        msg.velocity = [0.0, 0.0, float(vz_ned)]
+
+        # We’re not using acceleration / jerk here (set to NaN)
+        msg.acceleration = [math.nan, math.nan, math.nan]
+        msg.jerk = [math.nan, math.nan, math.nan]
+
+        # Yaw: keep 0 (aligned with default forward)
         msg.yaw = 0.0
+        msg.yawspeed = 0.0
+
         self.trajectory_setpoint_pub.publish(msg)
+
 
     def publish_attitude_setpoint(self, roll: float, pitch: float,
                                   yaw: float, thrust_norm: float):
