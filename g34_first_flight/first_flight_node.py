@@ -5,6 +5,7 @@ from enum import Enum, auto
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from px4_msgs.msg import (
     OffboardControlMode,
@@ -28,16 +29,20 @@ class G34FirstFlightNode(Node):
 
         # ---------------- Parameters ----------------
         self.declare_parameter('takeoff_height_m', 0.5)
-        self.declare_parameter('takeoff_phase_time_s', 3.0)       # time spent ascending
-        self.declare_parameter('position_hold_time_s', 5.0)       # time spent at hover height
-        self.declare_parameter('offboard_warmup_setpoints', 20)   # setpoints before OFFBOARD+ARM
-        self.declare_parameter('tuning_mode', 'none')             # 'none', 'altitude', 'attitude'
+        self.declare_parameter('altitude_tolerance_m', 0.05)
+        self.declare_parameter('takeoff_min_time_s', 1.5)       # must spend at least this long climbing
+        self.declare_parameter('takeoff_timeout_s', 8.0)        # max time before forcing HOVER
+        self.declare_parameter('position_hold_time_s', 5.0)     # time spent at hover height
+        self.declare_parameter('offboard_warmup_setpoints', 20)
+        self.declare_parameter('tuning_mode', 'none')           # 'none', 'altitude', 'attitude'
         self.declare_parameter('tuning_step_amplitude_m', 0.2)
         self.declare_parameter('tuning_step_duration_s', 3.0)
         self.declare_parameter('local_position_topic', '/fmu/out/vehicle_local_position_v1')
 
         self.takeoff_height_m = float(self.get_parameter('takeoff_height_m').value)
-        self.takeoff_phase_time_s = float(self.get_parameter('takeoff_phase_time_s').value)
+        self.altitude_tolerance_m = float(self.get_parameter('altitude_tolerance_m').value)
+        self.takeoff_min_time_s = float(self.get_parameter('takeoff_min_time_s').value)
+        self.takeoff_timeout_s = float(self.get_parameter('takeoff_timeout_s').value)
         self.position_hold_time_s = float(self.get_parameter('position_hold_time_s').value)
         self.offboard_warmup_setpoints = int(self.get_parameter('offboard_warmup_setpoints').value)
         self.tuning_mode = str(self.get_parameter('tuning_mode').value).lower()
@@ -45,15 +50,23 @@ class G34FirstFlightNode(Node):
         self.tuning_step_duration_s = float(self.get_parameter('tuning_step_duration_s').value)
         local_position_topic = self.get_parameter('local_position_topic').value
 
+        # ---------------- PX4 QoS ----------------
+        qos_px4 = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
         # ---------------- Publishers (to PX4) ----------------
         self.offboard_control_mode_pub = self.create_publisher(
-            OffboardControlMode, '/fmu/in/offboard_control_mode', 10
+            OffboardControlMode, '/fmu/in/offboard_control_mode', qos_px4
         )
         self.trajectory_setpoint_pub = self.create_publisher(
-            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', 10
+            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_px4
         )
         self.vehicle_command_pub = self.create_publisher(
-            VehicleCommand, '/fmu/in/vehicle_command', 10
+            VehicleCommand, '/fmu/in/vehicle_command', qos_px4
         )
 
         # ---------------- Subscribers (from PX4) ----------------
@@ -61,7 +74,7 @@ class G34FirstFlightNode(Node):
             VehicleLocalPosition,
             local_position_topic,
             self.local_position_callback,
-            10,
+            qos_px4,
         )
 
         # ---------------- State variables ----------------
@@ -86,7 +99,7 @@ class G34FirstFlightNode(Node):
     def local_position_callback(self, msg: VehicleLocalPosition):
         """
         PX4 local position: NED (z positive DOWN).
-        We *always* use -z as altitude up, no z_valid gating – SITL & HW both work.
+        We always use -z as altitude up. No z_valid gating.
         """
         self.current_altitude_up = -msg.z
 
@@ -141,7 +154,7 @@ class G34FirstFlightNode(Node):
     def publish_trajectory_setpoint(self, x_ned: float, y_ned: float, z_ned: float):
         """
         Position-only setpoint; yaw is set to NaN so PX4 *does not change yaw*.
-        This should minimize initial yaw motion and keep mission stable.
+        This minimizes initial yaw motion and keeps mission stable.
         """
         msg = TrajectorySetpoint()
         msg.timestamp = self.get_clock().now().nanoseconds // 1000
@@ -226,16 +239,27 @@ class G34FirstFlightNode(Node):
             self.mission_start_time = now
             self.get_logger().info('PREFLIGHT -> TAKEOFF_ASCEND')
 
-        # 3) Phase logic (time-based, not dependent on altitude validity)
+        # 3) Phase logic
         if self.flight_phase == FlightPhase.TAKEOFF_ASCEND:
             # Command target altitude; PX4 climbs to it
             z_cmd = -self.takeoff_height_m  # NED: up is negative
 
-            # Simple time-based transition to HOVER
-            if (now - self.mission_start_time) > self.takeoff_phase_time_s:
+            # Altitude-based transition with min-time + timeout safety
+            time_in_phase = now - (self.mission_start_time or now)
+            alt_ok = False
+            if self.current_altitude_up is not None:
+                alt_err = abs(self.current_altitude_up - self.takeoff_height_m)
+                alt_ok = alt_err < self.altitude_tolerance_m
+
+            if (
+                alt_ok and time_in_phase > self.takeoff_min_time_s
+            ) or time_in_phase > self.takeoff_timeout_s:
                 self.flight_phase = FlightPhase.HOVER
                 self.hover_start_time = now
-                self.get_logger().info('TAKEOFF_ASCEND -> HOVER')
+                self.get_logger().info(
+                    f'TAKEOFF_ASCEND -> HOVER (time_in_phase={time_in_phase:.1f}s, alt_up='
+                    f'{self.current_altitude_up if self.current_altitude_up is not None else float("nan"):.2f} m)'
+                )
 
         elif self.flight_phase == FlightPhase.HOVER:
             t_hover = now - (self.hover_start_time or now)
